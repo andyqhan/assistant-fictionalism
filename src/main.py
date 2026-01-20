@@ -1,6 +1,10 @@
+from prompt_toolkit import prompt
+from prompt_toolkit.formatted_text import HTML
+
 from .model import ChatModel
 from .commands import process_command
-from .colors import user_color, assistant_color, system_color, error_color
+from .colors import assistant_color, system_color, error_color
+from .keyboard import cbreak_mode, check_escape
 
 
 def main() -> None:
@@ -21,7 +25,7 @@ def main() -> None:
 
     while True:
         try:
-            user_input = input(user_color("You: "))
+            user_input = prompt(HTML("<ansigreen>You: </ansigreen>"))
         except KeyboardInterrupt:
             print()
             print(system_color("Goodbye!"))
@@ -43,21 +47,32 @@ def main() -> None:
 
         messages.append({"role": "user", "content": user_input})
 
+        # Display persona label before streaming
+        label = model.persona if model.persona else ""
+        if label:
+            print(assistant_color(f"{label}: "), end="", flush=True)
+
         try:
-            response = model.generate(messages)
+            response_chunks: list[str] = []
+            interrupted = False
+            with cbreak_mode():
+                for chunk in model.generate(messages):
+                    if check_escape():
+                        interrupted = True
+                        break
+                    print(assistant_color(chunk), end="", flush=True)
+                    response_chunks.append(chunk)
+            print()  # Newline after streaming completes
+            if interrupted:
+                print(system_color("(interrupted)"))
         except Exception as e:
+            print()  # Newline after any partial output
             print(error_color(f"Generation error: {e}"))
             messages.pop()
             continue
 
+        response = "".join(response_chunks)
         messages.append({"role": "assistant", "content": response})
-
-        # Display with persona label
-        label = model.persona if model.persona else ""
-        if label:
-            print(assistant_color(f"{label}: {response}"))
-        else:
-            print(assistant_color(response))
         print()
 
 
