@@ -35,6 +35,7 @@ dependencies = [
     { name = "colorama" },
     { name = "prompt-toolkit" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -44,6 +45,7 @@ requires-dist = [
     { name = "colorama", specifier = ">=0.4.6" },
     { name = "prompt-toolkit", specifier = ">=3.0.0" },
     { name = "torch", specifier = ">=2.0.0" },
+    { name = "tqdm", specifier = ">=4.65.0" },
     { name = "transformers", specifier = ">=4.51.0" },
 ]
 
