@@ -1,7 +1,8 @@
 from prompt_toolkit import prompt
 from prompt_toolkit.formatted_text import HTML
 
-from .model import ChatModel
+from src.model import ChatModel
+
 from .commands import process_command
 from .colors import assistant_color, system_color, error_color
 from .keyboard import cbreak_mode, check_escape

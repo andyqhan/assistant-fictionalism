@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from .colors import system_color, error_color
 
 if TYPE_CHECKING:
-    from .model import ChatModel
+    from src.model import ChatModel
 
 
 @dataclass
