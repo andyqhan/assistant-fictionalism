@@ -8,9 +8,12 @@ Run with:
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from scipy import stats
 
 st.set_page_config(
     page_title="Persona Inference Results",
@@ -131,6 +134,74 @@ def create_thinking_tokens_boxplot(df: pd.DataFrame, group_by: str = "category")
     return fig
 
 
+def compute_correlations(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute Pearson correlations and p-values for key metrics.
+
+    Returns:
+        Tuple of (correlation_matrix, p_value_matrix)
+    """
+    metrics = ["avg_entropy", "avg_top_k_mass", "think_end_position"]
+    metric_labels = {
+        "avg_entropy": "Entropy",
+        "avg_top_k_mass": "Top-k Mass",
+        "think_end_position": "Thinking Tokens",
+    }
+
+    n = len(metrics)
+    corr_matrix = np.zeros((n, n))
+    p_matrix = np.zeros((n, n))
+
+    for i, m1 in enumerate(metrics):
+        for j, m2 in enumerate(metrics):
+            if i == j:
+                corr_matrix[i, j] = 1.0
+                p_matrix[i, j] = 0.0
+            else:
+                # Drop NaN values for this pair
+                valid_mask = df[m1].notna() & df[m2].notna()
+                if valid_mask.sum() > 2:
+                    r, p = stats.pearsonr(df.loc[valid_mask, m1], df.loc[valid_mask, m2])
+                    corr_matrix[i, j] = r
+                    p_matrix[i, j] = p
+                else:
+                    corr_matrix[i, j] = np.nan
+                    p_matrix[i, j] = np.nan
+
+    labels = [metric_labels[m] for m in metrics]
+    corr_df = pd.DataFrame(corr_matrix, index=labels, columns=labels)
+    p_df = pd.DataFrame(p_matrix, index=labels, columns=labels)
+
+    return corr_df, p_df
+
+
+def create_correlation_heatmap(corr_df: pd.DataFrame, title: str) -> go.Figure:
+    """Create a correlation heatmap with annotations."""
+    # Create text annotations showing correlation values
+    text_annotations = corr_df.round(3).astype(str).values
+
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_df.values,
+        x=corr_df.columns.tolist(),
+        y=corr_df.index.tolist(),
+        text=text_annotations,
+        texttemplate="%{text}",
+        textfont={"size": 14},
+        colorscale="RdBu_r",
+        zmid=0,
+        zmin=-1,
+        zmax=1,
+        colorbar=dict(title="Correlation"),
+    ))
+
+    fig.update_layout(
+        title=title,
+        height=500,
+        xaxis=dict(side="bottom"),
+    )
+
+    return fig
+
+
 def main():
     st.title("Persona Inference Results Visualization")
 
@@ -204,8 +275,8 @@ def main():
             group_by = "category"
 
         # Create tabs for different visualizations
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Entropy", "Top-k Mass", "Thinking Tokens", "Raw Data"]
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
+            ["Entropy", "Top-k Mass", "Thinking Tokens", "Correlations", "Raw Data"]
         )
 
         with tab1:
@@ -251,6 +322,64 @@ def main():
                 st.dataframe(thinking_stats)
 
         with tab4:
+            # Determine title based on view mode
+            if view_mode == "Drill Down into Category":
+                corr_title = f"Metric Correlations for {drill_down_category}"
+            else:
+                corr_title = "Metric Correlations (All Categories)"
+
+            corr_df, p_df = compute_correlations(chart_df)
+            st.plotly_chart(
+                create_correlation_heatmap(corr_df, corr_title),
+                use_container_width=True,
+            )
+
+            st.subheader("Correlation Details")
+
+            # Create a detailed correlation table
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**Pearson Correlation Coefficients**")
+                st.dataframe(corr_df.round(4))
+
+            with col2:
+                st.markdown("**P-values**")
+                # Use scientific notation for very small p-values
+                def format_pvalue(x):
+                    if x == 0.0:
+                        return "< 1e-300"
+                    elif x < 0.0001:
+                        return f"{x:.2e}"
+                    else:
+                        return f"{x:.4f}"
+                st.dataframe(p_df.map(format_pvalue))
+
+            # Interpretation guide
+            with st.expander("Interpretation Guide"):
+                st.markdown("""
+**Correlation Coefficient (r):**
+- **r = 1.0**: Perfect positive correlation
+- **r = 0.0**: No linear correlation
+- **r = -1.0**: Perfect negative correlation
+
+**Strength Guidelines:**
+- |r| < 0.3: Weak
+- 0.3 ≤ |r| < 0.7: Moderate
+- |r| ≥ 0.7: Strong
+
+**P-value:**
+- p < 0.05: Statistically significant
+- p < 0.01: Highly significant
+- p < 0.001: Very highly significant
+
+**Note:** Correlations are computed on the currently filtered data.
+                """)
+
+            # Sample size info
+            st.info(f"Correlations computed on {len(chart_df):,} samples.")
+
+        with tab5:
             st.subheader("Raw Data")
             # Column selector
             display_cols = st.multiselect(
