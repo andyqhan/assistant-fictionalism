@@ -26,8 +26,10 @@ def load_results(file_path: Path) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def create_entropy_boxplot(df: pd.DataFrame) -> px.box:
-    """Create box-and-whisker plot for entropy metrics per category."""
+def create_entropy_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.box:
+    """Create box-and-whisker plot for entropy metrics per category or persona."""
+    assert group_by in ("category", "persona"), f"Invalid group_by: {group_by}"
+
     # Melt the dataframe to get entropy metrics in long format
     entropy_cols = ["avg_entropy_thinking", "avg_entropy_output", "avg_entropy"]
     melted = df.melt(
@@ -45,13 +47,16 @@ def create_entropy_boxplot(df: pd.DataFrame) -> px.box:
     }
     melted["metric"] = melted["metric"].map(metric_labels)
 
+    x_label = "Persona Category" if group_by == "category" else "Persona"
+    title = f"Entropy by {x_label}"
+
     fig = px.box(
         melted,
-        x="category",
+        x=group_by,
         y="entropy",
         color="metric",
-        title="Entropy by Persona Category",
-        labels={"entropy": "Entropy", "category": "Persona Category", "metric": "Section"},
+        title=title,
+        labels={"entropy": "Entropy", group_by: x_label, "metric": "Section"},
         category_orders={"metric": ["Thinking", "Output", "Overall"]},
     )
     fig.update_layout(
@@ -62,8 +67,10 @@ def create_entropy_boxplot(df: pd.DataFrame) -> px.box:
     return fig
 
 
-def create_top_k_mass_boxplot(df: pd.DataFrame) -> px.box:
-    """Create box-and-whisker plot for top-k mass metrics per category."""
+def create_top_k_mass_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.box:
+    """Create box-and-whisker plot for top-k mass metrics per category or persona."""
+    assert group_by in ("category", "persona"), f"Invalid group_by: {group_by}"
+
     # Melt the dataframe to get top-k mass metrics in long format
     top_k_cols = ["avg_top_k_mass_thinking", "avg_top_k_mass_output", "avg_top_k_mass"]
     melted = df.melt(
@@ -81,13 +88,16 @@ def create_top_k_mass_boxplot(df: pd.DataFrame) -> px.box:
     }
     melted["metric"] = melted["metric"].map(metric_labels)
 
+    x_label = "Persona Category" if group_by == "category" else "Persona"
+    title = f"Top-k Mass by {x_label}"
+
     fig = px.box(
         melted,
-        x="category",
+        x=group_by,
         y="top_k_mass",
         color="metric",
-        title="Top-k Mass by Persona Category",
-        labels={"top_k_mass": "Top-k Mass", "category": "Persona Category", "metric": "Section"},
+        title=title,
+        labels={"top_k_mass": "Top-k Mass", group_by: x_label, "metric": "Section"},
         category_orders={"metric": ["Thinking", "Output", "Overall"]},
     )
     fig.update_layout(
@@ -98,15 +108,20 @@ def create_top_k_mass_boxplot(df: pd.DataFrame) -> px.box:
     return fig
 
 
-def create_thinking_tokens_boxplot(df: pd.DataFrame) -> px.box:
-    """Create box-and-whisker plot for thinking tokens per category."""
+def create_thinking_tokens_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.box:
+    """Create box-and-whisker plot for thinking tokens per category or persona."""
+    assert group_by in ("category", "persona"), f"Invalid group_by: {group_by}"
+
+    x_label = "Persona Category" if group_by == "category" else "Persona"
+    title = f"Number of Thinking Tokens by {x_label}"
+
     fig = px.box(
         df,
-        x="category",
+        x=group_by,
         y="think_end_position",
-        title="Number of Thinking Tokens by Persona Category",
-        labels={"think_end_position": "Thinking Tokens", "category": "Persona Category"},
-        color="category",
+        title=title,
+        labels={"think_end_position": "Thinking Tokens", group_by: x_label},
+        color=group_by,
     )
     fig.update_layout(
         xaxis_tickangle=-45,
@@ -167,18 +182,39 @@ def main():
         else:
             filtered_df = df
 
+        # View mode toggle
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("View Mode")
+        view_mode = st.sidebar.radio(
+            "Select view mode",
+            options=["All Categories", "Drill Down into Category"],
+            index=0,
+        )
+
+        # Determine group_by and chart_df based on view mode
+        if view_mode == "Drill Down into Category":
+            drill_down_category = st.sidebar.selectbox(
+                "Select category to drill down",
+                options=sorted(filtered_df["category"].unique()),
+            )
+            chart_df = filtered_df[filtered_df["category"] == drill_down_category]
+            group_by = "persona"
+        else:
+            chart_df = filtered_df
+            group_by = "category"
+
         # Create tabs for different visualizations
         tab1, tab2, tab3, tab4 = st.tabs(
             ["Entropy", "Top-k Mass", "Thinking Tokens", "Raw Data"]
         )
 
         with tab1:
-            st.plotly_chart(create_entropy_boxplot(filtered_df), use_container_width=True)
+            st.plotly_chart(create_entropy_boxplot(chart_df, group_by), use_container_width=True)
 
             # Summary statistics
             with st.expander("Summary Statistics"):
                 entropy_stats = (
-                    filtered_df.groupby("category")[
+                    chart_df.groupby(group_by)[
                         ["avg_entropy_thinking", "avg_entropy_output", "avg_entropy"]
                     ]
                     .agg(["mean", "std", "median"])
@@ -187,12 +223,12 @@ def main():
                 st.dataframe(entropy_stats)
 
         with tab2:
-            st.plotly_chart(create_top_k_mass_boxplot(filtered_df), use_container_width=True)
+            st.plotly_chart(create_top_k_mass_boxplot(chart_df, group_by), use_container_width=True)
 
             # Summary statistics
             with st.expander("Summary Statistics"):
                 top_k_stats = (
-                    filtered_df.groupby("category")[
+                    chart_df.groupby(group_by)[
                         ["avg_top_k_mass_thinking", "avg_top_k_mass_output", "avg_top_k_mass"]
                     ]
                     .agg(["mean", "std", "median"])
@@ -202,13 +238,13 @@ def main():
 
         with tab3:
             st.plotly_chart(
-                create_thinking_tokens_boxplot(filtered_df), use_container_width=True
+                create_thinking_tokens_boxplot(chart_df, group_by), use_container_width=True
             )
 
             # Summary statistics
             with st.expander("Summary Statistics"):
                 thinking_stats = (
-                    filtered_df.groupby("category")["think_end_position"]
+                    chart_df.groupby(group_by)["think_end_position"]
                     .agg(["mean", "std", "median", "min", "max"])
                     .round(2)
                 )
@@ -219,7 +255,7 @@ def main():
             # Column selector
             display_cols = st.multiselect(
                 "Select columns to display",
-                options=filtered_df.columns.tolist(),
+                options=chart_df.columns.tolist(),
                 default=[
                     "category",
                     "persona",
@@ -230,7 +266,7 @@ def main():
                 ],
             )
             if display_cols:
-                st.dataframe(filtered_df[display_cols], use_container_width=True)
+                st.dataframe(chart_df[display_cols], use_container_width=True)
 
 
 if __name__ == "__main__":
