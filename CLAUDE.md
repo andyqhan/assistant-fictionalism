@@ -21,7 +21,10 @@ sbatch hpc/batch_inference.slurm \
     --prompts-json=datasets/prompts.json \
     --personae-json=datasets/personae.json \
     --model='Qwen/Qwen3-8B' \
-    --batch-size=64
+    --batch-size=256
+
+# Run the visualization webapp
+uv run streamlit run src/viz/app.py
 ```
 
 ## Architecture
@@ -42,12 +45,15 @@ src/
 │   ├── metrics.py        # Entropy and top-k mass computation
 │   ├── system_prompts.py # System prompt generation
 │   └── config.py         # BatchInferenceConfig dataclass
-└── interactive/
+├── interactive/
+│   ├── __init__.py
+│   ├── main.py           # Interactive chat loop
+│   ├── commands.py       # Slash command handling
+│   ├── keyboard.py       # Terminal utilities for escape detection
+│   └── colors.py         # Terminal color formatting
+└── viz/
     ├── __init__.py
-    ├── main.py           # Interactive chat loop
-    ├── commands.py       # Slash command handling
-    ├── keyboard.py       # Terminal utilities for escape detection
-    └── colors.py         # Terminal color formatting
+    └── app.py            # Streamlit visualization webapp
 ```
 
 ### Interactive Mode (`src/interactive/`)
@@ -75,7 +81,7 @@ src/
 | `--model` | `Qwen/Qwen3-8B` | Model ID |
 | `--temperature` | `0.0` | Sampling temperature |
 | `--max-tokens` | `1024` | Max tokens to generate |
-| `--batch-size` | `64` | Batch size |
+| `--batch-size` | `256` | Batch size |
 | `--n-reps` | `1` | Repetitions per prompt |
 | `--top-k-mass-k` | `5` | k for top-k mass |
 | `--thinking-mode/--no-thinking-mode` | enabled | Thinking mode |
@@ -100,6 +106,20 @@ src/
 **Output Format:**
 Results saved to `logs/personae-inference-{SLURM_JOB_ID}/results.json`.
 
+### Visualization (`src/viz/`)
+
+**Purpose:** Interactive Streamlit webapp for exploring batch inference results.
+
+**Features:**
+- File selector for choosing results from different runs
+- Three visualization tabs:
+  - **Entropy**: Box-and-whisker plot showing `avg_entropy_thinking`, `avg_entropy_output`, and `avg_entropy` per category
+  - **Top-k Mass**: Box-and-whisker plot showing `avg_top_k_mass_thinking`, `avg_top_k_mass_output`, and `avg_top_k_mass` per category
+  - **Thinking Tokens**: Box-and-whisker plot showing `think_end_position` (number of thinking tokens) per category
+- Category filtering in the sidebar
+- Summary statistics expandable for each chart
+- Raw data view with column selection
+
 ### Shared Components
 
 **Persona System:**
@@ -120,3 +140,11 @@ Qwen3 models support a "thinking" mode where the model reasons internally before
 - Targets H200 GPUs via `--constraint=h200`
 - Uses Singularity container with CUDA 12.8.1
 - Logs to `hpc/logs/personae_inference_{job_id}.log`
+
+## Code Style
+
+**Defensive Programming:**
+- Use `assert` statements to validate tensor shapes, sizes, and invariants
+- Fail fast: check preconditions early and raise clear errors
+- Validate function inputs at the start of functions
+- Check tensor dimensions match expected shapes before operations
