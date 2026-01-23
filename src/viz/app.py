@@ -29,9 +29,12 @@ def load_results(file_path: Path) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def create_entropy_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.box:
-    """Create box-and-whisker plot for entropy metrics per category or persona."""
+def create_entropy_chart(
+    df: pd.DataFrame, group_by: str = "category", plot_type: str = "box"
+) -> go.Figure:
+    """Create box or violin plot for entropy metrics per category or persona."""
     assert group_by in ("category", "persona"), f"Invalid group_by: {group_by}"
+    assert plot_type in ("box", "violin"), f"Invalid plot_type: {plot_type}"
 
     # Melt the dataframe to get entropy metrics in long format
     entropy_cols = ["avg_entropy_thinking", "avg_entropy_output", "avg_entropy"]
@@ -53,7 +56,8 @@ def create_entropy_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.b
     x_label = "Persona Category" if group_by == "category" else "Persona"
     title = f"Entropy by {x_label}"
 
-    fig = px.box(
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
         melted,
         x=group_by,
         y="entropy",
@@ -62,17 +66,21 @@ def create_entropy_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.b
         labels={"entropy": "Entropy", group_by: x_label, "metric": "Section"},
         category_orders={"metric": ["Thinking", "Output", "Overall"]},
     )
+    mode_key = "violinmode" if plot_type == "violin" else "boxmode"
     fig.update_layout(
-        boxmode="group",
+        **{mode_key: "group"},
         xaxis_tickangle=-45,
         height=900,
     )
     return fig
 
 
-def create_top_k_mass_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.box:
-    """Create box-and-whisker plot for top-k mass metrics per category or persona."""
+def create_top_k_mass_chart(
+    df: pd.DataFrame, group_by: str = "category", plot_type: str = "box"
+) -> go.Figure:
+    """Create box or violin plot for top-k mass metrics per category or persona."""
     assert group_by in ("category", "persona"), f"Invalid group_by: {group_by}"
+    assert plot_type in ("box", "violin"), f"Invalid plot_type: {plot_type}"
 
     # Melt the dataframe to get top-k mass metrics in long format
     top_k_cols = ["avg_top_k_mass_thinking", "avg_top_k_mass_output", "avg_top_k_mass"]
@@ -94,7 +102,8 @@ def create_top_k_mass_boxplot(df: pd.DataFrame, group_by: str = "category") -> p
     x_label = "Persona Category" if group_by == "category" else "Persona"
     title = f"Top-k Mass by {x_label}"
 
-    fig = px.box(
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
         melted,
         x=group_by,
         y="top_k_mass",
@@ -103,22 +112,27 @@ def create_top_k_mass_boxplot(df: pd.DataFrame, group_by: str = "category") -> p
         labels={"top_k_mass": "Top-k Mass", group_by: x_label, "metric": "Section"},
         category_orders={"metric": ["Thinking", "Output", "Overall"]},
     )
+    mode_key = "violinmode" if plot_type == "violin" else "boxmode"
     fig.update_layout(
-        boxmode="group",
+        **{mode_key: "group"},
         xaxis_tickangle=-45,
         height=900,
     )
     return fig
 
 
-def create_thinking_tokens_boxplot(df: pd.DataFrame, group_by: str = "category") -> px.box:
-    """Create box-and-whisker plot for thinking tokens per category or persona."""
+def create_thinking_tokens_chart(
+    df: pd.DataFrame, group_by: str = "category", plot_type: str = "box"
+) -> go.Figure:
+    """Create box or violin plot for thinking tokens per category or persona."""
     assert group_by in ("category", "persona"), f"Invalid group_by: {group_by}"
+    assert plot_type in ("box", "violin"), f"Invalid plot_type: {plot_type}"
 
     x_label = "Persona Category" if group_by == "category" else "Persona"
     title = f"Number of Thinking Tokens by {x_label}"
 
-    fig = px.box(
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
         df,
         x=group_by,
         y="think_end_position",
@@ -274,13 +288,24 @@ def main():
             chart_df = filtered_df
             group_by = "category"
 
+        # Plot type toggle
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Chart Options")
+        plot_type = st.sidebar.radio(
+            "Plot type",
+            options=["Box", "Violin"],
+            index=0,
+            horizontal=True,
+        )
+        plot_type = plot_type.lower()
+
         # Create tabs for different visualizations
         tab1, tab2, tab3, tab4, tab5 = st.tabs(
             ["Entropy", "Top-k Mass", "Thinking Tokens", "Correlations", "Raw Data"]
         )
 
         with tab1:
-            st.plotly_chart(create_entropy_boxplot(chart_df, group_by), use_container_width=True)
+            st.plotly_chart(create_entropy_chart(chart_df, group_by, plot_type), use_container_width=True)
 
             # Summary statistics
             with st.expander("Summary Statistics"):
@@ -294,7 +319,7 @@ def main():
                 st.dataframe(entropy_stats)
 
         with tab2:
-            st.plotly_chart(create_top_k_mass_boxplot(chart_df, group_by), use_container_width=True)
+            st.plotly_chart(create_top_k_mass_chart(chart_df, group_by, plot_type), use_container_width=True)
 
             # Summary statistics
             with st.expander("Summary Statistics"):
@@ -309,7 +334,7 @@ def main():
 
         with tab3:
             st.plotly_chart(
-                create_thinking_tokens_boxplot(chart_df, group_by), use_container_width=True
+                create_thinking_tokens_chart(chart_df, group_by, plot_type), use_container_width=True
             )
 
             # Summary statistics
