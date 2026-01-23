@@ -72,6 +72,11 @@ def create_entropy_chart(
         xaxis_tickangle=-45,
         height=900,
     )
+    # Show mean in addition to median
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
     return fig
 
 
@@ -118,6 +123,11 @@ def create_top_k_mass_chart(
         xaxis_tickangle=-45,
         height=900,
     )
+    # Show mean in addition to median
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
     return fig
 
 
@@ -145,6 +155,11 @@ def create_thinking_tokens_chart(
         height=900,
         showlegend=False,
     )
+    # Show mean in addition to median
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
     return fig
 
 
