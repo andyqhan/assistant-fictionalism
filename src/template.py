@@ -1,6 +1,23 @@
 from transformers import PreTrainedTokenizerBase
 
 
+def _escape_for_jinja_string(s: str, quote_char: str) -> str:
+    """
+    Escape a string for safe insertion into a Jinja2 string literal.
+
+    Args:
+        s: The string to escape
+        quote_char: The quote character used for the string literal (' or ")
+
+    Returns:
+        The escaped string safe for insertion into a Jinja2 template
+    """
+    # Escape backslashes first, then the quote character
+    escaped = s.replace("\\", "\\\\")
+    escaped = escaped.replace(quote_char, f"\\{quote_char}")
+    return escaped
+
+
 def patch_chat_template(tokenizer: PreTrainedTokenizerBase, original_template: str, persona: str) -> None:
     """
     Patch the chat template to use a custom persona instead of 'assistant'.
@@ -27,15 +44,19 @@ def patch_chat_template(tokenizer: PreTrainedTokenizerBase, original_template: s
     # We patch the generation prompt suffix specifically
 
     # Patch the generation prompt that adds '<|im_start|>assistant\n' at the end
+    # Escape the persona for safe insertion into Jinja2 single-quoted string
+    escaped_persona_single = _escape_for_jinja_string(persona, "'")
     patched = patched.replace(
         "'<|im_start|>assistant\\n'",
-        f"'<|im_start|>{persona}\\n'" if persona else "'<|im_start|>'"
+        f"'<|im_start|>{escaped_persona_single}\\n'" if persona else "'<|im_start|>'"
     )
 
     # Also handle the case where it might not have the escaped newline
+    # Escape the persona for safe insertion into Jinja2 double-quoted string
+    escaped_persona_double = _escape_for_jinja_string(persona, '"')
     patched = patched.replace(
         "\"<|im_start|>assistant\\n\"",
-        f"\"<|im_start|>{persona}\\n\"" if persona else "\"<|im_start|>\""
+        f"\"<|im_start|>{escaped_persona_double}\\n\"" if persona else "\"<|im_start|>\""
     )
 
     tokenizer.chat_template = patched

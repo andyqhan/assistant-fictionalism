@@ -14,6 +14,7 @@ class BatchInferenceConfig:
     batch_size: int = 64
     n_reps: int = 1
     top_k_mass_k: int = 5
+    logprobs_k: int = 20
     thinking_mode: bool = True
     system_prompt_style: str = "you-are-a"
     output_dir: str = ""
@@ -31,6 +32,8 @@ class BatchInferenceConfig:
         assert self.batch_size > 0, f"batch_size must be positive, got {self.batch_size}"
         assert self.n_reps > 0, f"n_reps must be positive, got {self.n_reps}"
         assert self.top_k_mass_k > 0, f"top_k_mass_k must be positive, got {self.top_k_mass_k}"
+        assert self.logprobs_k > 0, f"logprobs_k must be positive, got {self.logprobs_k}"
+        assert self.logprobs_k >= self.top_k_mass_k, f"logprobs_k must be >= top_k_mass_k, got {self.logprobs_k} < {self.top_k_mass_k}"
         assert 0.0 < self.subset_category_persona <= 1.0, f"subset_category_persona must be in (0, 1], got {self.subset_category_persona}"
         assert 0.0 < self.subset_prompt <= 1.0, f"subset_prompt must be in (0, 1], got {self.subset_prompt}"
 
@@ -63,6 +66,7 @@ class BatchInferenceConfig:
             "batch_size": self.batch_size,
             "n_reps": self.n_reps,
             "top_k_mass_k": self.top_k_mass_k,
+            "logprobs_k": self.logprobs_k,
             "thinking_mode": self.thinking_mode,
             "system_prompt_style": self.system_prompt_style,
             "output_dir": self.output_dir,
