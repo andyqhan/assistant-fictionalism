@@ -4,7 +4,7 @@ def generate_system_prompt_you_are_a(persona: str, article: str) -> str:
 
     Args:
         persona: The persona name (e.g., "assistant", "Hamlet")
-        article: The article to use (e.g., "an", "a", or "" for none)
+        article: The article to use (e.g., "an", "a", "none", or "" for no article)
 
     Returns:
         System prompt string like "You are an assistant." or "You are Hamlet."
@@ -12,7 +12,8 @@ def generate_system_prompt_you_are_a(persona: str, article: str) -> str:
     assert isinstance(persona, str), f"Persona must be a string, got {type(persona)}"
     assert isinstance(article, str), f"Article must be a string, got {type(article)}"
 
-    if article:
+    # Handle "none" as no article (same as empty string)
+    if article and article != "none":
         return f"You are {article} {persona}."
     else:
         return f"You are {persona}."

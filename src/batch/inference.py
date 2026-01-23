@@ -8,27 +8,243 @@ entropy and top-k mass metrics for generated responses.
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor
 
 from src.device import get_device, get_dtype
 from src.template import patch_chat_template
 
 from .config import BatchInferenceConfig
-from .metrics import compute_metrics_for_sequence
 from .system_prompts import generate_system_prompt
 
 
 # Qwen3 </think> token ID
 THINK_END_TOKEN_ID = 151668
+
+
+class MetricsLogitsProcessor(LogitsProcessor):
+    """
+    LogitsProcessor that computes entropy and top-k mass incrementally.
+
+    Computes metrics for each token during generation, avoiding the need to
+    store full logits tensors (which consume ~40GB for batch=64, max_tokens=1024).
+    """
+
+    def __init__(self, batch_size: int, top_k: int, think_end_token_id: int):
+        """
+        Args:
+            batch_size: Number of sequences in the batch
+            top_k: k for top-k mass computation
+            think_end_token_id: Token ID for </think> token
+        """
+        assert batch_size > 0, f"batch_size must be positive, got {batch_size}"
+        assert top_k > 0, f"top_k must be positive, got {top_k}"
+
+        self.batch_size = batch_size
+        self.top_k = top_k
+        self.think_end_token_id = think_end_token_id
+
+        # Per-sequence metrics storage (list of scalars per sequence)
+        self.entropies: list[list[float]] = [[] for _ in range(batch_size)]
+        self.top_k_masses: list[list[float]] = [[] for _ in range(batch_size)]
+        self.token_ids: list[list[int]] = [[] for _ in range(batch_size)]
+
+        # Track </think> position per sequence (None if not found yet)
+        self.think_end_positions: list[int | None] = [None] * batch_size
+
+        self._step = 0
+
+    def __call__(
+        self, input_ids: torch.Tensor, scores: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Process logits for current generation step.
+
+        Args:
+            input_ids: Shape (batch_size, seq_len) - full sequence so far
+            scores: Shape (batch_size, vocab_size) - logits for next token
+
+        Returns:
+            Unmodified scores tensor
+        """
+        assert scores.dim() == 2, f"Expected 2D scores, got {scores.dim()}D"
+        batch_size, vocab_size = scores.shape
+        assert batch_size == self.batch_size, (
+            f"Batch size mismatch: expected {self.batch_size}, got {batch_size}"
+        )
+
+        # Compute probabilities
+        probs = F.softmax(scores, dim=-1)
+        log_probs = F.log_softmax(scores, dim=-1)
+
+        # Compute entropy: -sum(p * log(p))
+        entropy = -torch.sum(probs * log_probs, dim=-1)  # (batch_size,)
+        assert entropy.shape == (batch_size,), (
+            f"Entropy shape mismatch: expected ({batch_size},), got {entropy.shape}"
+        )
+
+        # Compute top-k mass
+        actual_k = min(self.top_k, vocab_size)
+        topk_probs, _ = torch.topk(probs, actual_k, dim=-1)
+        top_k_mass = topk_probs.sum(dim=-1)  # (batch_size,)
+        assert top_k_mass.shape == (batch_size,), (
+            f"Top-k mass shape mismatch: expected ({batch_size},), got {top_k_mass.shape}"
+        )
+
+        # Get the token that will be selected (greedy = argmax of scores)
+        # Note: This is approximate - actual sampling may differ with temperature > 0
+        # For metrics purposes, we record what the model would greedily choose
+        next_tokens = scores.argmax(dim=-1)  # (batch_size,)
+
+        # Store metrics for each sequence
+        entropy_list = entropy.tolist()
+        top_k_mass_list = top_k_mass.tolist()
+        next_tokens_list = next_tokens.tolist()
+
+        for i in range(batch_size):
+            self.entropies[i].append(entropy_list[i])
+            self.top_k_masses[i].append(top_k_mass_list[i])
+            self.token_ids[i].append(next_tokens_list[i])
+
+            # Track </think> position
+            if (
+                self.think_end_positions[i] is None
+                and next_tokens_list[i] == self.think_end_token_id
+            ):
+                self.think_end_positions[i] = self._step
+
+        self._step += 1
+
+        # Return scores unmodified
+        return scores
+
+    def get_metrics(self, batch_idx: int) -> dict:
+        """
+        Get computed metrics for a sequence.
+
+        Args:
+            batch_idx: Index of sequence in batch
+
+        Returns:
+            Dictionary with averaged metrics
+        """
+        assert 0 <= batch_idx < self.batch_size, (
+            f"batch_idx {batch_idx} out of range [0, {self.batch_size})"
+        )
+
+        entropies = self.entropies[batch_idx]
+        top_k_masses = self.top_k_masses[batch_idx]
+        think_end_pos = self.think_end_positions[batch_idx]
+
+        num_tokens = len(entropies)
+
+        if num_tokens == 0:
+            return {
+                "avg_entropy_thinking": None,
+                "avg_entropy_output": None,
+                "avg_entropy": None,
+                "avg_top_k_mass_thinking": None,
+                "avg_top_k_mass_output": None,
+                "avg_top_k_mass": None,
+                "think_end_position": None,
+                "num_tokens": 0,
+            }
+
+        # Overall averages
+        avg_entropy = sum(entropies) / num_tokens
+        avg_top_k_mass = sum(top_k_masses) / num_tokens
+
+        # Split by thinking/output
+        if think_end_pos is not None:
+            # Thinking: indices 0 to think_end_pos (inclusive)
+            thinking_entropies = entropies[: think_end_pos + 1]
+            thinking_top_k = top_k_masses[: think_end_pos + 1]
+
+            # Output: indices after think_end_pos
+            output_entropies = entropies[think_end_pos + 1 :]
+            output_top_k = top_k_masses[think_end_pos + 1 :]
+
+            avg_entropy_thinking = (
+                sum(thinking_entropies) / len(thinking_entropies)
+                if thinking_entropies
+                else None
+            )
+            avg_top_k_mass_thinking = (
+                sum(thinking_top_k) / len(thinking_top_k)
+                if thinking_top_k
+                else None
+            )
+            avg_entropy_output = (
+                sum(output_entropies) / len(output_entropies)
+                if output_entropies
+                else None
+            )
+            avg_top_k_mass_output = (
+                sum(output_top_k) / len(output_top_k) if output_top_k else None
+            )
+        else:
+            # No thinking section - all tokens are output
+            avg_entropy_thinking = None
+            avg_top_k_mass_thinking = None
+            avg_entropy_output = avg_entropy
+            avg_top_k_mass_output = avg_top_k_mass
+
+        return {
+            "avg_entropy_thinking": avg_entropy_thinking,
+            "avg_entropy_output": avg_entropy_output,
+            "avg_entropy": avg_entropy,
+            "avg_top_k_mass_thinking": avg_top_k_mass_thinking,
+            "avg_top_k_mass_output": avg_top_k_mass_output,
+            "avg_top_k_mass": avg_top_k_mass,
+            "think_end_position": think_end_pos,
+            "num_tokens": num_tokens,
+        }
+
+    def update_token_ids_from_output(
+        self, generated_ids: torch.Tensor, input_len: int
+    ) -> None:
+        """
+        Update token_ids with actual generated tokens (handles sampling).
+
+        When using temperature > 0, the actual sampled tokens may differ from
+        the greedy argmax we tracked during processing. This method corrects
+        the token_ids and think_end_positions using the actual output.
+
+        Args:
+            generated_ids: Shape (batch_size, total_seq_len) - full sequences
+            input_len: Length of input (to extract only generated portion)
+        """
+        assert generated_ids.dim() == 2, (
+            f"Expected 2D generated_ids, got {generated_ids.dim()}D"
+        )
+        batch_size = generated_ids.shape[0]
+        assert batch_size == self.batch_size, (
+            f"Batch size mismatch: expected {self.batch_size}, got {batch_size}"
+        )
+
+        for i in range(batch_size):
+            actual_tokens = generated_ids[i, input_len:].tolist()
+            num_tracked = len(self.token_ids[i])
+
+            # Only update up to the number of tokens we tracked metrics for
+            actual_tokens = actual_tokens[:num_tracked]
+            self.token_ids[i] = actual_tokens
+
+            # Recompute think_end_position with actual tokens
+            self.think_end_positions[i] = None
+            for pos, tid in enumerate(actual_tokens):
+                if tid == self.think_end_token_id:
+                    self.think_end_positions[i] = pos
+                    break
 
 
 class GPUMonitor:
@@ -192,6 +408,44 @@ def load_personae(path: str) -> list[PersonaInfo]:
     return personae
 
 
+def subset_prompts(prompts: list[PromptInfo], fraction: float) -> list[PromptInfo]:
+    """Subset prompts by taking a fraction (rounded up) from the list."""
+    if fraction >= 1.0:
+        return prompts
+    count = math.ceil(len(prompts) * fraction)
+    return prompts[:count]
+
+
+def subset_personae_by_category(personae: list[PersonaInfo], fraction: float) -> list[PersonaInfo]:
+    """
+    Subset personae by taking a fraction (rounded up) from each category.
+
+    Args:
+        personae: List of PersonaInfo objects
+        fraction: Fraction of personae to keep per category (rounded up)
+
+    Returns:
+        Subsetted list preserving order within categories
+    """
+    if fraction >= 1.0:
+        return personae
+
+    # Group personae by category while preserving order
+    categories: dict[str, list[PersonaInfo]] = {}
+    for p in personae:
+        if p.category not in categories:
+            categories[p.category] = []
+        categories[p.category].append(p)
+
+    # Take fraction (rounded up) from each category
+    result = []
+    for category, category_personae in categories.items():
+        count = math.ceil(len(category_personae) * fraction)
+        result.extend(category_personae[:count])
+
+    return result
+
+
 def build_tasks(
     prompts: list[PromptInfo],
     personae: list[PersonaInfo],
@@ -286,12 +540,15 @@ class BatchInferenceRunner:
         Run inference on a batch of tasks with the same persona.
 
         All tasks must have the same persona (for consistent template).
+        Uses incremental metrics computation to avoid storing full logits.
 
         Returns:
             List of result dictionaries.
         """
         if len(tasks) == 0:
             return []
+
+        batch_size = len(tasks)
 
         # Verify all tasks have same persona
         persona = tasks[0].persona_info.persona
@@ -316,11 +573,27 @@ class BatchInferenceRunner:
             truncation=True,
         ).to(self.device)
 
+        # Validate input tensor shapes
+        assert inputs.input_ids.dim() == 2, (
+            f"Expected 2D input_ids, got {inputs.input_ids.dim()}D"
+        )
+        assert inputs.input_ids.shape[0] == batch_size, (
+            f"Input batch size mismatch: expected {batch_size}, "
+            f"got {inputs.input_ids.shape[0]}"
+        )
+
         # Use the padded input length (same for all sequences in batch)
         # This is the correct starting position for generated tokens with left-padding
         padded_input_len = inputs.input_ids.shape[1]
 
-        # Generate with logits
+        # Create metrics processor for incremental computation
+        metrics_processor = MetricsLogitsProcessor(
+            batch_size=batch_size,
+            top_k=self.cfg.top_k_mass_k,
+            think_end_token_id=THINK_END_TOKEN_ID,
+        )
+
+        # Generate with incremental metrics (no output_scores=True!)
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
@@ -329,34 +602,32 @@ class BatchInferenceRunner:
                 temperature=self.cfg.temperature if self.cfg.temperature > 0 else None,
                 pad_token_id=self.tokenizer.pad_token_id,
                 return_dict_in_generate=True,
-                output_scores=True,
+                output_scores=False,  # Don't store scores - we compute metrics incrementally
+                logits_processor=[metrics_processor],
             )
+
+        # Validate output
+        generated_ids = outputs.sequences
+        assert generated_ids.dim() == 2, (
+            f"Expected 2D sequences, got {generated_ids.dim()}D"
+        )
+        assert generated_ids.shape[0] == batch_size, (
+            f"Output batch size mismatch: expected {batch_size}, "
+            f"got {generated_ids.shape[0]}"
+        )
+
+        # Update processor with actual sampled tokens (important for temperature > 0)
+        metrics_processor.update_token_ids_from_output(generated_ids, padded_input_len)
 
         # Process outputs
         results = []
-        generated_ids = outputs.sequences
-        scores = outputs.scores  # Tuple of (batch_size, vocab_size) per step
-
         for batch_idx, task in enumerate(tasks):
-            input_len = padded_input_len
-
             # Extract generated token IDs (excluding input)
             full_seq = generated_ids[batch_idx]
-            gen_token_ids = full_seq[input_len:].tolist()
+            gen_token_ids = full_seq[padded_input_len:].tolist()
 
-            # Extract logits for this sequence
-            logits_list = []
-            for step_idx, step_scores in enumerate(scores):
-                if step_idx < len(gen_token_ids):
-                    logits_list.append(step_scores[batch_idx])
-
-            # Compute metrics
-            metrics = compute_metrics_for_sequence(
-                logits_list=logits_list,
-                token_ids=gen_token_ids,
-                think_end_token_id=THINK_END_TOKEN_ID,
-                top_k=self.cfg.top_k_mass_k,
-            )
+            # Get metrics from processor
+            metrics = metrics_processor.get_metrics(batch_idx)
 
             # Decode response
             response = self.tokenizer.decode(
@@ -466,7 +737,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=256,
         help="Batch size for inference",
     )
     parser.add_argument(
@@ -512,6 +783,18 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Seconds between GPU utilization logs (0 to disable)",
     )
+    parser.add_argument(
+        "--subset-category-persona",
+        type=float,
+        default=1.0,
+        help="Fraction of personae to use per category (rounded up)",
+    )
+    parser.add_argument(
+        "--subset-prompt",
+        type=float,
+        default=1.0,
+        help="Fraction of prompts to use",
+    )
 
     return parser.parse_args()
 
@@ -533,6 +816,8 @@ def main() -> None:
         thinking_mode=args.thinking_mode,
         system_prompt_style=args.system_prompt_style,
         output_dir=args.output_dir,
+        subset_category_persona=args.subset_category_persona,
+        subset_prompt=args.subset_prompt,
     )
 
     print(f"Configuration: {cfg.to_dict()}")
@@ -543,6 +828,15 @@ def main() -> None:
 
     personae = load_personae(cfg.personae_json)
     print(f"Loaded {len(personae)} personae")
+
+    # Apply subsetting
+    if cfg.subset_prompt < 1.0:
+        prompts = subset_prompts(prompts, cfg.subset_prompt)
+        print(f"Subsetted to {len(prompts)} prompts (fraction={cfg.subset_prompt})")
+
+    if cfg.subset_category_persona < 1.0:
+        personae = subset_personae_by_category(personae, cfg.subset_category_persona)
+        print(f"Subsetted to {len(personae)} personae (fraction={cfg.subset_category_persona} per category)")
 
     # Build task list
     tasks = build_tasks(prompts, personae, cfg.n_reps, cfg.system_prompt_style)

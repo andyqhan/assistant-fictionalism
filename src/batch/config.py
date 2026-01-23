@@ -17,6 +17,8 @@ class BatchInferenceConfig:
     thinking_mode: bool = True
     system_prompt_style: str = "you-are-a"
     output_dir: str = ""
+    subset_category_persona: float = 1.0
+    subset_prompt: float = 1.0
 
     def __post_init__(self) -> None:
         # Validate paths exist
@@ -29,6 +31,8 @@ class BatchInferenceConfig:
         assert self.batch_size > 0, f"batch_size must be positive, got {self.batch_size}"
         assert self.n_reps > 0, f"n_reps must be positive, got {self.n_reps}"
         assert self.top_k_mass_k > 0, f"top_k_mass_k must be positive, got {self.top_k_mass_k}"
+        assert 0.0 < self.subset_category_persona <= 1.0, f"subset_category_persona must be in (0, 1], got {self.subset_category_persona}"
+        assert 0.0 < self.subset_prompt <= 1.0, f"subset_prompt must be in (0, 1], got {self.subset_prompt}"
 
         # Validate system prompt style
         valid_styles = ["you-are-a"]
@@ -62,4 +66,6 @@ class BatchInferenceConfig:
             "thinking_mode": self.thinking_mode,
             "system_prompt_style": self.system_prompt_style,
             "output_dir": self.output_dir,
+            "subset_category_persona": self.subset_category_persona,
+            "subset_prompt": self.subset_prompt,
         }
