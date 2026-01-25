@@ -59,6 +59,38 @@ def compute_top_k_mass(logits: torch.Tensor, k: int) -> torch.Tensor:
     return top_k_mass
 
 
+def compute_entropy_and_top_k_mass(
+    logits: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute both entropy and top-k mass efficiently with a single softmax.
+
+    Args:
+        logits: Tensor of shape (..., vocab_size) containing raw logits
+        k: Number of top probabilities to sum for top-k mass
+
+    Returns:
+        Tuple of (entropy, top_k_mass) tensors, each of shape (...)
+    """
+    assert logits.dim() >= 1, f"Logits must have at least 1 dimension, got {logits.dim()}"
+    assert k > 0, f"k must be positive, got {k}"
+
+    # Single softmax computation for both metrics
+    probs = F.softmax(logits, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Entropy: -sum(p * log(p))
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+
+    # Top-k mass
+    vocab_size = probs.shape[-1]
+    actual_k = min(k, vocab_size)
+    topk_probs, _ = torch.topk(probs, actual_k, dim=-1)
+    top_k_mass = topk_probs.sum(dim=-1)
+
+    return entropy, top_k_mass
+
+
 def compute_metrics_for_sequence(
     logits_list: list[torch.Tensor],
     token_ids: list[int],
