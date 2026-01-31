@@ -79,5 +79,4 @@ dmypy.json
 Thumbs.db
 
 # Inference logs and results
-logs/*.log
-logs/personae-inference-*/
+logs/
