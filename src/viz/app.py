@@ -23,10 +23,27 @@ st.set_page_config(
 
 
 def load_results(file_path: Path) -> pd.DataFrame:
-    """Load results JSON into a DataFrame."""
-    with open(file_path) as f:
-        data = json.load(f)
-    return pd.DataFrame(data)
+    """Load results from JSON or JSONL into a DataFrame.
+
+    Args:
+        file_path: Path to results.json or results.jsonl file
+
+    Returns:
+        DataFrame with results data
+    """
+    if file_path.suffix == ".jsonl":
+        # JSONL: one JSON object per line
+        data = []
+        with open(file_path) as f:
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line))
+        return pd.DataFrame(data)
+    else:
+        # JSON: array of objects
+        with open(file_path) as f:
+            data = json.load(f)
+        return pd.DataFrame(data)
 
 
 def create_entropy_chart(
@@ -237,13 +254,22 @@ def main():
     # Sidebar for file selection
     st.sidebar.header("Data Selection")
 
-    # Find available results files
+    # Find available results files (prefer .jsonl, fall back to .json)
     logs_dir = Path("logs")
-    results_files = list(logs_dir.glob("*/results.json"))
+    jsonl_files = set(logs_dir.glob("*/results.jsonl"))
+    json_files = set(logs_dir.glob("*/results.json"))
+
+    # Build results_files list, preferring .jsonl when both exist
+    jsonl_dirs = {f.parent for f in jsonl_files}
+    results_files = list(jsonl_files)
+    # Add .json files only if no .jsonl exists in that directory
+    for json_file in json_files:
+        if json_file.parent not in jsonl_dirs:
+            results_files.append(json_file)
 
     if not results_files:
         st.error("No results files found in logs/ directory.")
-        st.info("Expected path pattern: logs/personae-inference-*/results.json")
+        st.info("Expected path pattern: logs/personae-inference-*/results.jsonl or results.json")
         return
 
     # File selector
