@@ -136,10 +136,41 @@ Qwen3 models support a "thinking" mode where the model reasons internally before
 
 ## HPC
 
-**SLURM Script:** `hpc/batch_inference.slurm`
+### Python Environment
+
+**Two separate environments:**
+- **Local development:** Uses `uv` to manage dependencies (via `pyproject.toml`). Run with `uv run python ...`.
+- **HPC compute nodes:** Uses a **separate venv** at `/scratch/ah7660/venvs/assistant-fictionalism-env` that runs inside a Singularity container.
+
+**Why separate environments?**
+The HPC uses Singularity containers for CUDA/GPU support. The venv is stored on `/scratch` (mounted into the container) rather than using `uv` because:
+1. The container provides the CUDA runtime needed for GPU packages
+2. Packages requiring CUDA at install time (e.g., `flash-attn`) must be installed inside the container
+
+**Installing HPC dependencies:**
+```bash
+# Install a package that requires CUDA (runs inside Singularity container)
+sbatch hpc/install_package.slurm flash-attn --no-build-isolation
+
+# The script uses python -m pip inside the container to install packages
+```
+
+**Note:** The HPC venv is created by `uv` but doesn't include pip by default. If pip is missing, install it first:
+```bash
+uv pip install pip --python /scratch/ah7660/venvs/assistant-fictionalism-env/bin/python
+```
+
+### SLURM Scripts
+
+**`hpc/batch_inference.slurm`** - Main inference script
 - Targets H200 GPUs via `--constraint=h200`
-- Uses Singularity container with CUDA 12.8.1
-- Logs to `hpc/logs/personae_inference_{job_id}.log`
+- Uses Singularity container: `/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif`
+- Activates venv inside container: `source ${VENV}/bin/activate`
+- Logs to `logs/personae_inference_{job_id}.log`
+
+**`hpc/install_package.slurm`** - Install packages requiring CUDA
+- Runs `pip install` inside the Singularity container
+- Use for packages that need CUDA at compile time (flash-attn, etc.)
 
 ## Code Style
 
