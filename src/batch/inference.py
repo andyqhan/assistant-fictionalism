@@ -557,13 +557,6 @@ class TransformersInferenceRunner:
             )
         self.model.eval()
 
-        # Try torch.compile for potential speedup (graceful fallback if unsupported)
-        try:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
-            print("Model compiled with torch.compile (reduce-overhead mode)")
-        except Exception as e:
-            print(f"torch.compile unavailable ({e}), using eager mode")
-
         print("Model loaded successfully.")
 
     def set_persona(self, persona: str) -> None:

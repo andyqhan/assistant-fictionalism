@@ -14,17 +14,21 @@ class BatchInferenceConfig:
     batch_size: int = 64
     n_reps: int = 1
     top_k_mass_k: int = 5
-    logprobs_k: int = 20
+    logprobs_k: int = 10000  # -1 means full vocab (vLLM only)
     thinking_mode: bool = True
     system_prompt_style: str = "you-are-a"
     output_dir: str = ""
     subset_category_persona: float = 1.0
     subset_prompt: float = 1.0
+    backend: str = "transformers"  # "transformers" or "vllm"
 
     def __post_init__(self) -> None:
         # Validate paths exist
         assert os.path.exists(self.prompts_json), f"Prompts file not found: {self.prompts_json}"
         assert os.path.exists(self.personae_json), f"Personae file not found: {self.personae_json}"
+
+        # Validate backend
+        assert self.backend in ["transformers", "vllm"], f"backend must be 'transformers' or 'vllm', got {self.backend}"
 
         # Validate numeric parameters
         assert self.temperature >= 0.0, f"Temperature must be non-negative, got {self.temperature}"
@@ -32,8 +36,10 @@ class BatchInferenceConfig:
         assert self.batch_size > 0, f"batch_size must be positive, got {self.batch_size}"
         assert self.n_reps > 0, f"n_reps must be positive, got {self.n_reps}"
         assert self.top_k_mass_k > 0, f"top_k_mass_k must be positive, got {self.top_k_mass_k}"
-        assert self.logprobs_k > 0, f"logprobs_k must be positive, got {self.logprobs_k}"
-        assert self.logprobs_k >= self.top_k_mass_k, f"logprobs_k must be >= top_k_mass_k, got {self.logprobs_k} < {self.top_k_mass_k}"
+        # logprobs_k validation only applies to vLLM backend (transformers uses full vocab)
+        if self.backend == "vllm":
+            assert self.logprobs_k > 0 or self.logprobs_k == -1, f"logprobs_k must be positive or -1, got {self.logprobs_k}"
+            assert self.logprobs_k == -1 or self.logprobs_k >= self.top_k_mass_k, f"logprobs_k must be >= top_k_mass_k, got {self.logprobs_k} < {self.top_k_mass_k}"
         assert 0.0 < self.subset_category_persona <= 1.0, f"subset_category_persona must be in (0, 1], got {self.subset_category_persona}"
         assert 0.0 < self.subset_prompt <= 1.0, f"subset_prompt must be in (0, 1], got {self.subset_prompt}"
 
@@ -72,4 +78,15 @@ class BatchInferenceConfig:
             "output_dir": self.output_dir,
             "subset_category_persona": self.subset_category_persona,
             "subset_prompt": self.subset_prompt,
+            "backend": self.backend,
         }
+
+    def to_comparable_dict(self) -> dict:
+        """Convert config to dictionary for comparison, excluding output_dir.
+
+        Used for resume detection - configs match if all parameters except
+        output_dir are identical.
+        """
+        d = self.to_dict()
+        del d["output_dir"]
+        return d
