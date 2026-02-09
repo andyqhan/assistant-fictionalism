@@ -26,11 +26,18 @@ class EmbeddingConfig:
     model: str = "Qwen/Qwen3-Embedding-0.6B"
     batch_size: int = 64
     max_length: int = 8192
+    pooling: str = "last_token"
     output: str = ""
 
     def __post_init__(self) -> None:
         # Validate input file exists
         assert Path(self.input).exists(), f"Input file not found: {self.input}"
+
+        # Validate pooling method
+        valid_pooling = {"last_token", "mean"}
+        assert self.pooling in valid_pooling, (
+            f"Invalid pooling method '{self.pooling}', must be one of {valid_pooling}"
+        )
 
         # Auto-generate output path if not specified
         if not self.output:
@@ -49,6 +56,25 @@ def extract_output(response: str) -> str:
     if "</think>" in response:
         return response.split("</think>", 1)[1].strip()
     return response.strip()  # No thinking tags, whole response is output
+
+
+def mean_pool(
+    last_hidden_states: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute mean-pooled embeddings, masking out padding tokens.
+
+    Args:
+        last_hidden_states: Hidden states from model (batch, seq_len, hidden_dim)
+        attention_mask: Attention mask (batch, seq_len)
+
+    Returns:
+        Embeddings tensor (batch, hidden_dim)
+    """
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).float()
+    sum_embeddings = torch.sum(last_hidden_states * input_mask_expanded, dim=1)
+    sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
+    return sum_embeddings / sum_mask
 
 
 def last_token_pool(
@@ -94,8 +120,9 @@ class EmbeddingRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
         assert self.tokenizer is not None, "Failed to load tokenizer"
 
-        # Set left padding (required for last_token_pool)
-        self.tokenizer.padding_side = "left"
+        # Set padding side based on pooling method
+        # last_token_pool requires left padding; mean pooling uses right padding
+        self.tokenizer.padding_side = "left" if cfg.pooling == "last_token" else "right"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -150,7 +177,8 @@ class EmbeddingRunner:
 
         with torch.inference_mode():
             outputs = self.model(**inputs)
-            embeddings = last_token_pool(outputs.last_hidden_state, inputs.attention_mask)
+            pool_fn = mean_pool if self.cfg.pooling == "mean" else last_token_pool
+            embeddings = pool_fn(outputs.last_hidden_state, inputs.attention_mask)
 
             # L2 normalize
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
@@ -264,6 +292,13 @@ def parse_args() -> argparse.Namespace:
         help="Maximum sequence length",
     )
     parser.add_argument(
+        "--pooling",
+        type=str,
+        default="last_token",
+        choices=["last_token", "mean"],
+        help="Pooling method: last_token (for Qwen, F2LLM) or mean (for KaLM)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="",
@@ -282,6 +317,7 @@ def main() -> None:
         model=args.model,
         batch_size=args.batch_size,
         max_length=args.max_length,
+        pooling=args.pooling,
         output=args.output,
     )
 
@@ -290,6 +326,7 @@ def main() -> None:
     print(f"  Model: {cfg.model}")
     print(f"  Batch size: {cfg.batch_size}")
     print(f"  Max length: {cfg.max_length}")
+    print(f"  Pooling: {cfg.pooling}")
     print(f"  Output: {cfg.output}")
 
     runner = EmbeddingRunner(cfg)
