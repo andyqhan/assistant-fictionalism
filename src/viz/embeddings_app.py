@@ -8,6 +8,8 @@ Run webapp with:
     uv run streamlit run src/viz/embeddings_app.py
 """
 
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -18,6 +20,47 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
+
+
+def discover_variance_files(logs_dir: str = "logs") -> list[str]:
+    """Discover embedding variance files in consistency-inference directories.
+
+    Args:
+        logs_dir: Base directory to search for logs
+
+    Returns:
+        List of paths to embedding_variance.parquet files, sorted by directory name (newest first)
+    """
+    logs_path = Path(logs_dir)
+    if not logs_path.exists():
+        return []
+
+    variance_files = []
+    for dir_path in logs_path.iterdir():
+        if dir_path.is_dir() and dir_path.name.startswith("consistency-inference-"):
+            variance_file = dir_path / "embedding_variance.parquet"
+            if variance_file.exists():
+                variance_files.append(str(variance_file))
+
+    # Sort by directory name descending (newest job IDs first)
+    return sorted(variance_files, reverse=True)
+
+
+def build_category_color_map(df: pd.DataFrame) -> dict[str, str]:
+    """Build a consistent color map for categories.
+
+    Args:
+        df: DataFrame with a 'category' column
+
+    Returns:
+        Dictionary mapping category names to hex colors
+    """
+    if "category" not in df.columns:
+        return {}
+
+    categories = sorted(df["category"].unique())
+    colors = px.colors.qualitative.Plotly
+    return {cat: colors[i % len(colors)] for i, cat in enumerate(categories)}
 
 
 @st.cache_data
@@ -31,6 +74,7 @@ def create_variance_bar_chart(
     prompt_id: int,
     question_text: str,
     has_category: bool = False,
+    color_map: dict[str, str] | None = None,
 ) -> go.Figure:
     """Create a bar chart of total variance per persona for a specific prompt.
 
@@ -39,6 +83,7 @@ def create_variance_bar_chart(
         prompt_id: The prompt ID to filter for
         question_text: The question text to display in the title
         has_category: Whether to color by category
+        color_map: Optional dictionary mapping category names to colors for consistency
 
     Returns:
         Plotly figure with bar chart
@@ -55,6 +100,7 @@ def create_variance_bar_chart(
         x="persona",
         y="total_variance",
         color="category" if has_category else None,
+        color_discrete_map=color_map if has_category and color_map else None,
         title=f"Prompt {prompt_id}: {title_text}",
         labels={
             "total_variance": "Total Variance (Trace of Cov)",
@@ -69,16 +115,133 @@ def create_variance_bar_chart(
     return fig
 
 
+def calculate_category_rankings(df: pd.DataFrame, prompt_id: int) -> pd.DataFrame:
+    """Calculate variance rank per category (averaged across personas) for each embedding column.
+
+    Args:
+        df: DataFrame with columns: prompt_id, persona, embedding_column, total_variance, category
+        prompt_id: The prompt ID to calculate rankings for
+
+    Returns:
+        DataFrame with columns: category, embedding_column, avg_variance, rank
+        Rank 1 = lowest average variance (will be plotted at top due to reversed y-axis)
+    """
+    prompt_df = df[df["prompt_id"] == prompt_id].copy()
+
+    # Calculate average variance per category within each embedding column
+    category_variance = (
+        prompt_df.groupby(["embedding_column", "category"])["total_variance"]
+        .mean()
+        .reset_index()
+        .rename(columns={"total_variance": "avg_variance"})
+    )
+
+    # Calculate rank within each embedding column (rank 1 = lowest variance)
+    category_variance["rank"] = category_variance.groupby("embedding_column")[
+        "avg_variance"
+    ].rank(ascending=True, method="min").astype(int)
+
+    return category_variance
+
+
+def create_ranking_line_chart(
+    df: pd.DataFrame,
+    prompt_id: int,
+    question_text: str,
+    color_map: dict[str, str] | None = None,
+) -> go.Figure:
+    """Create line chart showing category rank changes across embedding columns.
+
+    Args:
+        df: Full DataFrame with all data (must have 'category' column)
+        prompt_id: The prompt ID to create chart for
+        question_text: The question text to display in the title
+        color_map: Optional dictionary mapping category names to colors for consistency
+
+    Returns:
+        Plotly figure with line chart (one line per category)
+    """
+    ranking_df = calculate_category_rankings(df, prompt_id)
+
+    # Truncate question text for title
+    title_text = question_text[:80] + "..." if len(question_text) > 80 else question_text
+
+    # Define column order for x-axis
+    column_order = [
+        "response1_embeddings_full",
+        "response1_embeddings_thinking",
+        "response1_embeddings_output",
+        "response2_embeddings_full",
+        "response2_embeddings_thinking",
+        "response2_embeddings_output",
+    ]
+    # Filter to only columns that exist in the data
+    existing_columns = [c for c in column_order if c in ranking_df["embedding_column"].unique()]
+    # Add any columns not in our predefined order
+    for col in ranking_df["embedding_column"].unique():
+        if col not in existing_columns:
+            existing_columns.append(col)
+
+    fig = px.line(
+        ranking_df,
+        x="embedding_column",
+        y="rank",
+        color="category",
+        markers=True,
+        title=f"Prompt {prompt_id}: {title_text}",
+        labels={
+            "rank": "Category Variance Rank",
+            "embedding_column": "Embedding Column",
+            "category": "Category",
+        },
+        category_orders={"embedding_column": existing_columns},
+        color_discrete_map=color_map,
+    )
+
+    fig.update_layout(
+        height=500,
+        yaxis=dict(autorange="reversed"),  # Rank 1 at top
+        xaxis_tickangle=-45,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.3,
+            xanchor="center",
+            x=0.5,
+        ),
+    )
+
+    return fig
+
+
 def main():
     st.title("Embedding Variance by Persona")
 
-    # Default file path
-    default_path = "logs/consistency-inference-1225210/embedding_variance.parquet"
+    # Auto-discover variance files
+    discovered_files = discover_variance_files()
 
     # Sidebar
     with st.sidebar:
         st.header("Data Selection")
-        file_path = st.text_input("Variance file path", value=default_path)
+
+        if discovered_files:
+            # Show dropdown with discovered files
+            file_path = st.selectbox(
+                "Select variance file",
+                options=discovered_files,
+                format_func=lambda x: Path(x).parent.name,  # Show just the directory name
+            )
+            # Also allow manual input
+            custom_path = st.text_input("Or enter custom path", value="")
+            if custom_path:
+                file_path = custom_path
+        else:
+            # No files discovered, fall back to text input
+            st.warning("No variance files found in logs/")
+            file_path = st.text_input(
+                "Variance file path",
+                value="logs/consistency-inference-1225210/embedding_variance.parquet",
+            )
 
     # Load data
     try:
@@ -175,39 +338,86 @@ def main():
             "question": [f"Prompt {pid}" for pid in sorted(df["prompt_id"].unique())],
         })
 
-    # Check if category column exists
+    # Check if category column exists and build color map
     has_category = "category" in df.columns
+    color_map = build_category_color_map(df) if has_category else None
 
-    # Create charts for each prompt
-    st.markdown(f"### Variance by Persona (using `{selected_embedding}`)")
+    # Create tabs
+    tab1, tab2 = st.tabs(["Variance by Persona", "Ranking Changes"])
 
-    for _, row in prompts.iterrows():
-        prompt_id = row["prompt_id"]
-        question_text = row["question"]
+    # Tab 1: Variance bar charts (existing functionality)
+    with tab1:
+        st.markdown(f"### Variance by Persona (using `{selected_embedding}`)")
 
-        # Check if this prompt has data after filtering
-        if prompt_id not in filtered_df["prompt_id"].values:
-            continue
+        for _, row in prompts.iterrows():
+            prompt_id = row["prompt_id"]
+            question_text = row["question"]
 
-        fig = create_variance_bar_chart(filtered_df, prompt_id, question_text, has_category)
-        st.plotly_chart(fig, use_container_width=True)
+            # Check if this prompt has data after filtering
+            if prompt_id not in filtered_df["prompt_id"].values:
+                continue
 
-        # Summary statistics for this prompt
-        prompt_variance = filtered_df[filtered_df["prompt_id"] == prompt_id]
-        with st.expander(f"Statistics for Prompt {prompt_id}"):
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Mean Variance", f"{prompt_variance['total_variance'].mean():.4f}")
-            col2.metric("Std Variance", f"{prompt_variance['total_variance'].std():.4f}")
-            col3.metric("Min Variance", f"{prompt_variance['total_variance'].min():.4f}")
-            col4.metric("Max Variance", f"{prompt_variance['total_variance'].max():.4f}")
+            fig = create_variance_bar_chart(
+                filtered_df, prompt_id, question_text, has_category, color_map
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    # Raw data view
-    st.markdown("---")
-    with st.expander("View Raw Variance Data"):
-        display_df = filtered_df.sort_values(
-            ["prompt_id", "total_variance"], ascending=[True, False]
-        )
-        st.dataframe(display_df, use_container_width=True)
+            # Summary statistics for this prompt
+            prompt_variance = filtered_df[filtered_df["prompt_id"] == prompt_id]
+            with st.expander(f"Statistics for Prompt {prompt_id}"):
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Mean Variance", f"{prompt_variance['total_variance'].mean():.4f}")
+                col2.metric("Std Variance", f"{prompt_variance['total_variance'].std():.4f}")
+                col3.metric("Min Variance", f"{prompt_variance['total_variance'].min():.4f}")
+                col4.metric("Max Variance", f"{prompt_variance['total_variance'].max():.4f}")
+
+        # Raw data view
+        st.markdown("---")
+        with st.expander("View Raw Variance Data"):
+            display_df = filtered_df.sort_values(
+                ["prompt_id", "total_variance"], ascending=[True, False]
+            )
+            st.dataframe(display_df, use_container_width=True)
+
+    # Tab 2: Ranking changes across embedding columns (by category)
+    with tab2:
+        if not has_category:
+            st.warning("Category data not available. This tab requires a 'category' column.")
+        else:
+            st.markdown("### Category Ranking Changes Across Embedding Columns")
+            st.markdown(
+                "This view shows how each category's average variance rank changes across "
+                "different embedding columns. Rank 1 (top) = lowest average variance."
+            )
+
+            # Filter df by selected categories for ranking chart
+            ranking_filtered_df = df.copy()
+            if selected_categories:
+                ranking_filtered_df = ranking_filtered_df[
+                    ranking_filtered_df["category"].isin(selected_categories)
+                ]
+
+            for _, row in prompts.iterrows():
+                prompt_id = row["prompt_id"]
+                question_text = row["question"]
+
+                # Check if this prompt has data after filtering
+                if prompt_id not in ranking_filtered_df["prompt_id"].values:
+                    continue
+
+                fig = create_ranking_line_chart(
+                    ranking_filtered_df, prompt_id, question_text, color_map
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Summary statistics for ranking changes
+                ranking_df = calculate_category_rankings(ranking_filtered_df, prompt_id)
+                with st.expander(f"Ranking Statistics for Prompt {prompt_id}"):
+                    # Calculate rank variability per category
+                    rank_stats = ranking_df.groupby("category")["rank"].agg(["mean", "std", "min", "max"])
+                    rank_stats.columns = ["Mean Rank", "Rank Std", "Best Rank", "Worst Rank"]
+                    rank_stats = rank_stats.sort_values("Mean Rank")
+                    st.dataframe(rank_stats, use_container_width=True)
 
 
 if __name__ == "__main__":
