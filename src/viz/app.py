@@ -1,6 +1,11 @@
 """
 Streamlit webapp for visualizing persona inference results.
 
+Supports three result types:
+- metrics: entropy, top-k mass, thinking tokens from batch inference
+- judge: endorsement/flagged analysis from LLM judge
+- embeddings: embedding variance analysis from consistency experiments
+
 Run with:
     uv run streamlit run src/viz/app.py
 """
@@ -26,24 +31,91 @@ ENDORSEMENT_COLORS = {
 ENDORSEMENT_ORDER = ["accept", "partial", "reject", "redirect"]
 
 st.set_page_config(
-    page_title="Persona Inference Results",
+    page_title="Persona Experiment Results",
     page_icon="📊",
     layout="wide",
 )
 
 
 def detect_result_type(file_path: Path) -> str:
-    """Detect if this is 'judge' results or 'metrics' results.
+    """Detect if this is 'judge', 'metrics', or 'embeddings' results.
 
     Args:
         file_path: Path to the results file
 
     Returns:
-        'judge' if this is judged_results.jsonl, 'metrics' otherwise
+        'judge', 'metrics', or 'embeddings'
     """
+    if file_path.suffix == ".parquet":
+        return "embeddings"
     if file_path.name == "judged_results.jsonl":
         return "judge"
     return "metrics"
+
+
+def discover_result_files(logs_dir: str = "logs") -> list[tuple[Path, str]]:
+    """Discover all recognized result files under logs/.
+
+    Scans every subdirectory under logs/ and collects:
+    - judged_results.jsonl -> "judge"
+    - results.jsonl / results.json -> "metrics" (judged_results.jsonl takes priority)
+    - embedding_variance*.parquet -> "embeddings"
+
+    Returns:
+        List of (file_path, result_type) tuples, sorted by directory name descending.
+    """
+    logs_path = Path(logs_dir)
+    if not logs_path.exists():
+        return []
+
+    result_files: list[tuple[Path, str]] = []
+
+    for dir_path in sorted(logs_path.iterdir(), reverse=True):
+        if not dir_path.is_dir():
+            continue
+
+        # Check for judge/metrics files (at most one per directory)
+        judged = dir_path / "judged_results.jsonl"
+        jsonl = dir_path / "results.jsonl"
+        json_file = dir_path / "results.json"
+
+        if judged.exists():
+            result_files.append((judged, "judge"))
+        elif jsonl.exists():
+            result_files.append((jsonl, "metrics"))
+        elif json_file.exists():
+            result_files.append((json_file, "metrics"))
+
+        # Check for embedding variance files (can coexist with above)
+        for parquet_file in sorted(dir_path.glob("embedding_variance*.parquet")):
+            result_files.append((parquet_file, "embeddings"))
+
+    return result_files
+
+
+def format_file_label(file_path: Path, result_type: str) -> str:
+    """Format a file path + result type for display in the file selector.
+
+    Examples:
+        consistency-inference-1225210 [embeddings]
+        consistency-judge-pipeline-20260209_125904 [embeddings: kalm-embedding]
+        prefill-inference-1472066 [judge]
+        personae-inference-1855290 [metrics]
+    """
+    dir_name = file_path.parent.name
+
+    if result_type == "embeddings":
+        # Check for model suffix: embedding_variance_<model>.parquet
+        stem = file_path.stem  # e.g. "embedding_variance_kalm-embedding" or "embedding_variance"
+        prefix = "embedding_variance"
+        if stem.startswith(prefix + "_"):
+            model_name = stem[len(prefix) + 1:]
+            return f"{dir_name} [embeddings: {model_name}]"
+        return f"{dir_name} [embeddings]"
+    elif result_type == "judge":
+        return f"{dir_name} [judge]"
+    else:
+        return f"{dir_name} [metrics]"
 
 
 def load_results(file_path: Path) -> pd.DataFrame:
@@ -96,6 +168,174 @@ def flatten_judge_parsed(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.get("reasoning") if isinstance(x, dict) else None
     )
     return df
+
+
+@st.cache_data
+def load_variance_data(file_path: str) -> pd.DataFrame:
+    """Load precomputed variance parquet file."""
+    return pd.read_parquet(file_path)
+
+
+def build_category_color_map(df: pd.DataFrame) -> dict[str, str]:
+    """Build a consistent color map for categories.
+
+    Args:
+        df: DataFrame with a 'category' column
+
+    Returns:
+        Dictionary mapping category names to hex colors
+    """
+    if "category" not in df.columns:
+        return {}
+
+    categories = sorted(df["category"].unique())
+    colors = px.colors.qualitative.Plotly
+    return {cat: colors[i % len(colors)] for i, cat in enumerate(categories)}
+
+
+def create_variance_bar_chart(
+    df: pd.DataFrame,
+    prompt_id: int,
+    question_text: str,
+    has_category: bool = False,
+    color_map: dict[str, str] | None = None,
+) -> go.Figure:
+    """Create a bar chart of total variance per persona for a specific prompt.
+
+    Args:
+        df: DataFrame with columns: prompt_id, persona, total_variance, and optionally category
+        prompt_id: The prompt ID to filter for
+        question_text: The question text to display in the title
+        has_category: Whether to color by category
+        color_map: Optional dictionary mapping category names to colors for consistency
+
+    Returns:
+        Plotly figure with bar chart
+    """
+    prompt_df = df[df["prompt_id"] == prompt_id].sort_values(
+        "total_variance", ascending=False
+    )
+
+    # Truncate question text for title
+    title_text = question_text[:80] + "..." if len(question_text) > 80 else question_text
+
+    fig = px.bar(
+        prompt_df,
+        x="persona",
+        y="total_variance",
+        color="category" if has_category else None,
+        color_discrete_map=color_map if has_category and color_map else None,
+        title=f"Prompt {prompt_id}: {title_text}",
+        labels={
+            "total_variance": "Total Variance (Trace of Cov)",
+            "persona": "Persona",
+            "category": "Category",
+        },
+    )
+    fig.update_layout(
+        xaxis_tickangle=-45,
+        height=500,
+    )
+    return fig
+
+
+def calculate_category_rankings(df: pd.DataFrame, prompt_id: int) -> pd.DataFrame:
+    """Calculate variance rank per category (averaged across personas) for each embedding column.
+
+    Args:
+        df: DataFrame with columns: prompt_id, persona, embedding_column, total_variance, category
+        prompt_id: The prompt ID to calculate rankings for
+
+    Returns:
+        DataFrame with columns: category, embedding_column, avg_variance, rank
+        Rank 1 = lowest average variance (will be plotted at top due to reversed y-axis)
+    """
+    prompt_df = df[df["prompt_id"] == prompt_id].copy()
+
+    # Calculate average variance per category within each embedding column
+    category_variance = (
+        prompt_df.groupby(["embedding_column", "category"])["total_variance"]
+        .mean()
+        .reset_index()
+        .rename(columns={"total_variance": "avg_variance"})
+    )
+
+    # Calculate rank within each embedding column (rank 1 = lowest variance)
+    category_variance["rank"] = category_variance.groupby("embedding_column")[
+        "avg_variance"
+    ].rank(ascending=True, method="min").astype(int)
+
+    return category_variance
+
+
+def create_ranking_line_chart(
+    df: pd.DataFrame,
+    prompt_id: int,
+    question_text: str,
+    color_map: dict[str, str] | None = None,
+) -> go.Figure:
+    """Create line chart showing category rank changes across embedding columns.
+
+    Args:
+        df: Full DataFrame with all data (must have 'category' column)
+        prompt_id: The prompt ID to create chart for
+        question_text: The question text to display in the title
+        color_map: Optional dictionary mapping category names to colors for consistency
+
+    Returns:
+        Plotly figure with line chart (one line per category)
+    """
+    ranking_df = calculate_category_rankings(df, prompt_id)
+
+    # Truncate question text for title
+    title_text = question_text[:80] + "..." if len(question_text) > 80 else question_text
+
+    # Define column order for x-axis
+    column_order = [
+        "response1_embeddings_full",
+        "response1_embeddings_thinking",
+        "response1_embeddings_output",
+        "response2_embeddings_full",
+        "response2_embeddings_thinking",
+        "response2_embeddings_output",
+    ]
+    # Filter to only columns that exist in the data
+    existing_columns = [c for c in column_order if c in ranking_df["embedding_column"].unique()]
+    # Add any columns not in our predefined order
+    for col in ranking_df["embedding_column"].unique():
+        if col not in existing_columns:
+            existing_columns.append(col)
+
+    fig = px.line(
+        ranking_df,
+        x="embedding_column",
+        y="rank",
+        color="category",
+        markers=True,
+        title=f"Prompt {prompt_id}: {title_text}",
+        labels={
+            "rank": "Category Variance Rank",
+            "embedding_column": "Embedding Column",
+            "category": "Category",
+        },
+        category_orders={"embedding_column": existing_columns},
+        color_discrete_map=color_map,
+    )
+
+    fig.update_layout(
+        height=500,
+        yaxis=dict(autorange="reversed"),  # Rank 1 at top
+        xaxis_tickangle=-45,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.3,
+            xanchor="center",
+            x=0.5,
+        ),
+    )
+
+    return fig
 
 
 def create_entropy_chart(
@@ -442,7 +682,7 @@ def create_response_length_chart(
     df = compute_response_length_stats(df)
 
     # Compute averages per group
-    stats = df.groupby(group_by)[["thinking_chars", "output_chars"]].mean()
+    length_stats = df.groupby(group_by)[["thinking_chars", "output_chars"]].mean()
 
     # Sort by accept rate if requested
     if sort_by_accept and "endorsement" in df.columns:
@@ -450,22 +690,22 @@ def create_response_length_chart(
         if "accept" in counts.columns:
             totals = counts.sum(axis=1)
             accept_rate = counts["accept"] / totals
-            stats = stats.loc[accept_rate.sort_values(ascending=False).index]
+            length_stats = length_stats.loc[accept_rate.sort_values(ascending=False).index]
 
     # Create grouped bar chart
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
         name="Thinking",
-        x=stats.index,
-        y=stats["thinking_chars"],
+        x=length_stats.index,
+        y=length_stats["thinking_chars"],
         marker_color="#3498db",  # Blue
     ))
 
     fig.add_trace(go.Bar(
         name="Output",
-        x=stats.index,
-        y=stats["output_chars"],
+        x=length_stats.index,
+        y=length_stats["output_chars"],
         marker_color="#9b59b6",  # Purple
     ))
 
@@ -1092,68 +1332,226 @@ def render_metrics_view(df: pd.DataFrame) -> None:
             st.dataframe(chart_df[display_cols], use_container_width=True)
 
 
+def render_embeddings_view(df: pd.DataFrame) -> None:
+    """Render the embeddings variance visualization view.
+
+    Args:
+        df: DataFrame loaded from embedding_variance*.parquet
+    """
+    # Find embedding columns
+    embedding_columns = sorted(df["embedding_column"].unique())
+    if not embedding_columns:
+        st.error("No embedding columns found in the data.")
+        return
+
+    # Sidebar controls
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Configuration")
+
+        # Embedding column selector
+        selected_embedding = st.selectbox(
+            "Embedding Column",
+            options=embedding_columns,
+            index=0,
+        )
+
+        # Filters
+        st.markdown("---")
+        st.subheader("Filters")
+
+        # Category filter (if available)
+        if "category" in df.columns:
+            all_categories = sorted(df["category"].unique())
+            selected_categories = st.multiselect(
+                "Filter Categories",
+                options=all_categories,
+                default=all_categories,
+            )
+        else:
+            selected_categories = None
+
+        # Persona filter
+        all_personas = sorted(df["persona"].unique())
+        selected_personas = st.multiselect(
+            "Filter Personas",
+            options=all_personas,
+            default=all_personas,
+        )
+
+        # Dataset info
+        st.markdown("---")
+        st.subheader("Dataset Info")
+        st.write(f"Total records: {len(df):,}")
+        st.write(f"Unique prompts: {df['prompt_id'].nunique()}")
+        st.write(f"Unique personas: {df['persona'].nunique()}")
+        if "category" in df.columns:
+            st.write(f"Unique categories: {df['category'].nunique()}")
+        st.write(f"Embedding columns: {len(embedding_columns)}")
+        if "n_samples" in df.columns:
+            st.write(f"Samples per group: {df['n_samples'].iloc[0]}")
+
+    # Filter by selected embedding, categories, and personas
+    filtered_df = df[df["embedding_column"] == selected_embedding]
+    if selected_categories:
+        filtered_df = filtered_df[filtered_df["category"].isin(selected_categories)]
+    if selected_personas:
+        filtered_df = filtered_df[filtered_df["persona"].isin(selected_personas)]
+
+    if filtered_df.empty:
+        st.warning("No data to display with current filters.")
+        return
+
+    # Get unique prompts and their questions (if available)
+    if "question" in df.columns:
+        prompts = (
+            df[["prompt_id", "question"]]
+            .drop_duplicates()
+            .sort_values("prompt_id")
+        )
+    else:
+        # Fallback if no question column
+        prompts = pd.DataFrame({
+            "prompt_id": sorted(df["prompt_id"].unique()),
+            "question": [f"Prompt {pid}" for pid in sorted(df["prompt_id"].unique())],
+        })
+
+    # Check if category column exists and build color map
+    has_category = "category" in df.columns
+    color_map = build_category_color_map(df) if has_category else None
+
+    # Create tabs
+    tab1, tab2 = st.tabs(["Variance by Persona", "Ranking Changes"])
+
+    # Tab 1: Variance bar charts
+    with tab1:
+        st.markdown(f"### Variance by Persona (using `{selected_embedding}`)")
+
+        for _, row in prompts.iterrows():
+            prompt_id = row["prompt_id"]
+            question_text = row["question"]
+
+            # Check if this prompt has data after filtering
+            if prompt_id not in filtered_df["prompt_id"].values:
+                continue
+
+            fig = create_variance_bar_chart(
+                filtered_df, prompt_id, question_text, has_category, color_map
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Summary statistics for this prompt
+            prompt_variance = filtered_df[filtered_df["prompt_id"] == prompt_id]
+            with st.expander(f"Statistics for Prompt {prompt_id}"):
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Mean Variance", f"{prompt_variance['total_variance'].mean():.4f}")
+                col2.metric("Std Variance", f"{prompt_variance['total_variance'].std():.4f}")
+                col3.metric("Min Variance", f"{prompt_variance['total_variance'].min():.4f}")
+                col4.metric("Max Variance", f"{prompt_variance['total_variance'].max():.4f}")
+
+        # Raw data view
+        st.markdown("---")
+        with st.expander("View Raw Variance Data"):
+            display_df = filtered_df.sort_values(
+                ["prompt_id", "total_variance"], ascending=[True, False]
+            )
+            st.dataframe(display_df, use_container_width=True)
+
+    # Tab 2: Ranking changes across embedding columns (by category)
+    with tab2:
+        if not has_category:
+            st.warning("Category data not available. This tab requires a 'category' column.")
+        else:
+            st.markdown("### Category Ranking Changes Across Embedding Columns")
+            st.markdown(
+                "This view shows how each category's average variance rank changes across "
+                "different embedding columns. Rank 1 (top) = lowest average variance."
+            )
+
+            # Filter df by selected categories for ranking chart
+            ranking_filtered_df = df.copy()
+            if selected_categories:
+                ranking_filtered_df = ranking_filtered_df[
+                    ranking_filtered_df["category"].isin(selected_categories)
+                ]
+
+            for _, row in prompts.iterrows():
+                prompt_id = row["prompt_id"]
+                question_text = row["question"]
+
+                # Check if this prompt has data after filtering
+                if prompt_id not in ranking_filtered_df["prompt_id"].values:
+                    continue
+
+                fig = create_ranking_line_chart(
+                    ranking_filtered_df, prompt_id, question_text, color_map
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Summary statistics for ranking changes
+                ranking_df = calculate_category_rankings(ranking_filtered_df, prompt_id)
+                with st.expander(f"Ranking Statistics for Prompt {prompt_id}"):
+                    # Calculate rank variability per category
+                    rank_stats = ranking_df.groupby("category")["rank"].agg(["mean", "std", "min", "max"])
+                    rank_stats.columns = ["Mean Rank", "Rank Std", "Best Rank", "Worst Rank"]
+                    rank_stats = rank_stats.sort_values("Mean Rank")
+                    st.dataframe(rank_stats, use_container_width=True)
+
+
 def main():
-    st.title("Persona Inference Results Visualization")
+    st.title("Persona Experiment Results")
 
     # Sidebar for file selection
     st.sidebar.header("Data Selection")
 
-    # Find available results files
-    logs_dir = Path("logs")
+    # Discover all result files
+    result_entries = discover_result_files()
 
-    # Find all result file types
-    jsonl_files = set(logs_dir.glob("*/results.jsonl"))
-    json_files = set(logs_dir.glob("*/results.json"))
-    judged_files = set(logs_dir.glob("*/judged_results.jsonl"))
-
-    # Build results_files list
-    # For directories with judged_results.jsonl, prefer that
-    # Otherwise prefer results.jsonl over results.json
-    results_files = []
-    judged_dirs = {f.parent for f in judged_files}
-    jsonl_dirs = {f.parent for f in jsonl_files}
-
-    # Add judged files first
-    results_files.extend(judged_files)
-
-    # Add jsonl files (excluding dirs with judged files)
-    for f in jsonl_files:
-        if f.parent not in judged_dirs:
-            results_files.append(f)
-
-    # Add json files (excluding dirs with judged or jsonl files)
-    for f in json_files:
-        if f.parent not in judged_dirs and f.parent not in jsonl_dirs:
-            results_files.append(f)
-
-    if not results_files:
+    if not result_entries:
         st.error("No results files found in logs/ directory.")
-        st.info("Expected path pattern: logs/*/results.jsonl, results.json, or judged_results.jsonl")
+        st.info(
+            "Expected file patterns: logs/*/results.jsonl, results.json, "
+            "judged_results.jsonl, or embedding_variance*.parquet"
+        )
         return
 
+    # Build mapping from string key to (path, type)
+    file_options: dict[str, tuple[Path, str]] = {}
+    for file_path, result_type in result_entries:
+        key = str(file_path)
+        file_options[key] = (file_path, result_type)
+
+    # Build label map for format_func
+    label_map = {
+        key: format_file_label(path, rtype)
+        for key, (path, rtype) in file_options.items()
+    }
+
     # File selector
-    file_options = {str(f): f for f in sorted(results_files, reverse=True)}
-    selected_file = st.sidebar.selectbox(
+    selected_key = st.sidebar.selectbox(
         "Select results file",
         options=list(file_options.keys()),
-        format_func=lambda x: Path(x).parent.name + (" [judge]" if "judged" in x else ""),
+        format_func=lambda x: label_map[x],
     )
 
-    if selected_file:
-        file_path = file_options[selected_file]
-        result_type = detect_result_type(file_path)
+    if selected_key:
+        file_path, result_type = file_options[selected_key]
 
         # Load data
         with st.spinner("Loading results..."):
-            df = load_results(file_path)
-
-            # Flatten judge_parsed if this is judge results
-            if result_type == "judge":
-                df = flatten_judge_parsed(df)
+            if result_type == "embeddings":
+                df = load_variance_data(str(file_path))
+            else:
+                df = load_results(file_path)
+                # Flatten judge_parsed if this is judge results
+                if result_type == "judge":
+                    df = flatten_judge_parsed(df)
 
         # Render appropriate view based on result type
         if result_type == "judge":
             render_judge_view(df)
+        elif result_type == "embeddings":
+            render_embeddings_view(df)
         else:
             render_metrics_view(df)
 
