@@ -6,9 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64GB
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --time=04:00:00
-#SBATCH --constraint=h200
 
 # Exit on error
 set -e
@@ -41,15 +40,53 @@ echo "GPU Info:"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 echo ""
 
-# Run embedding computation inside container
-# Pass all script arguments to the Python script
-singularity exec --nv \
-    --bind /scratch:/scratch \
-    "${CONTAINER}" \
-    bash -c "
-        source ${VENV}/bin/activate && \
-        python -m src.batch.embeddings \"\$@\"
-    " -- "$@"
+# Parse --input argument
+INPUT=""
+for arg in "$@"; do
+    case "$arg" in
+        --input=*) INPUT="${arg#--input=}" ;;
+    esac
+done
+
+if [ -z "$INPUT" ]; then
+    echo "Usage: sbatch hpc/compute_embeddings.slurm --input=<path/to/results.jsonl>"
+    exit 1
+fi
+
+INPUT_DIR=$(dirname "$INPUT")
+
+# Define embedding models: model_id|pooling|output_key
+MODELS=(
+    "Qwen/Qwen3-Embedding-0.6B|last_token|qwen3-embedding-0.6b"
+    "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5|mean|kalm-embedding"
+    "codefuse-ai/F2LLM-1.7B|last_token|f2llm-1.7b"
+)
+
+# Run all three embedding models sequentially
+for entry in "${MODELS[@]}"; do
+    IFS='|' read -r MODEL POOLING KEY <<< "$entry"
+    OUTPUT="${INPUT_DIR}/embeddings_${KEY}.parquet"
+
+    echo ""
+    echo "=========================================="
+    echo "Running: ${KEY} (${MODEL}, pooling=${POOLING})"
+    echo "Output:  ${OUTPUT}"
+    echo "=========================================="
+
+    singularity exec --nv \
+        --bind /scratch:/scratch \
+        "${CONTAINER}" \
+        bash -c "
+            source ${VENV}/bin/activate && \
+            python -m src.batch.embeddings \
+                --input='${INPUT}' \
+                --model='${MODEL}' \
+                --pooling='${POOLING}' \
+                --output='${OUTPUT}'
+        "
+
+    echo "Finished: ${KEY}"
+done
 
 # Print completion info
 echo ""
