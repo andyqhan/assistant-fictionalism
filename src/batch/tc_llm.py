@@ -75,7 +75,11 @@ Labels to merge:
 
 CLASSIFY_TEMPLATE = """\
 You are a text classification expert. Given the label list and the text below, \
-assign up to {n_labels} labels ranked by relevance. Only use labels from the provided list. \
+assign up to {n_labels} labels ranked by relevance.
+
+IMPORTANT: You MUST copy labels EXACTLY as they appear in the list below — same spelling, \
+same capitalization, same punctuation. Do NOT rephrase, abbreviate, or reword any label.
+
 Return ONLY a JSON array ordered from most to least relevant: ["most_relevant", "second", ...]
 
 Available labels:
@@ -467,18 +471,25 @@ class TCLLMRunner:
         records: list[TCLLMRecord] = []
         parse_failures = 0
 
-        # Build a lookup for valid labels per group
-        group_valid_labels: dict[tuple[int, str], set[str]] = {}
+        # Build a case-insensitive lookup for valid labels per group
+        # Maps (prompt_id, persona) -> {lowercase_label: original_label}
+        group_valid_labels: dict[tuple[int, str], dict[str, str]] = {}
         for g in groups:
-            group_valid_labels[(g.prompt_id, g.persona)] = set(g.merged_labels or [])
+            group_valid_labels[(g.prompt_id, g.persona)] = {
+                l.lower(): l for l in (g.merged_labels or [])
+            }
 
         for (prompt_id, persona, rep_idx), output_text in zip(prompt_map, raw_outputs):
             parsed = parse_json_array(output_text)
-            valid_labels = group_valid_labels[(prompt_id, persona)]
+            valid_lookup = group_valid_labels[(prompt_id, persona)]
 
             if parsed:
-                # Filter to only valid labels, preserve order
-                filtered = [l for l in parsed if l in valid_labels]
+                # Case-insensitive match, canonicalize to original label form
+                filtered = []
+                for l in parsed:
+                    canonical = valid_lookup.get(l.lower())
+                    if canonical is not None and canonical not in filtered:
+                        filtered.append(canonical)
                 labels = filtered[:n_labels] if filtered else ["UNCLASSIFIED"]
             else:
                 parse_failures += 1

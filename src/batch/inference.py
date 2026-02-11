@@ -379,29 +379,36 @@ class VLLMInferenceRunner:
         # Store original template for persona patching
         self._original_template = self.tokenizer.chat_template
 
-        # Resolve logprobs_k: -1 means full vocab
-        if cfg.logprobs_k == -1:
+        # Resolve logprobs_k: -1 means full vocab, 0 when metrics disabled
+        if cfg.no_metrics:
+            self.logprobs_k = 0
+            print("Metrics disabled (--no-metrics): skipping logprobs")
+        elif cfg.logprobs_k == -1:
             self.logprobs_k = self.tokenizer.vocab_size
             print(f"logprobs_k=-1 resolved to vocab_size={self.logprobs_k}")
         else:
             self.logprobs_k = cfg.logprobs_k
 
         # Initialize vLLM
-        # max_logprobs=-1 removes the cap, allowing full vocab logprobs for accurate entropy
-        self.llm = LLM(
+        llm_kwargs = dict(
             model=cfg.model,
             dtype="auto",
             tensor_parallel_size=1,
             trust_remote_code=True,
-            max_logprobs=-1,
         )
+        if not cfg.no_metrics:
+            # max_logprobs=-1 removes the cap, allowing full vocab logprobs for accurate entropy
+            llm_kwargs["max_logprobs"] = -1
+        self.llm = LLM(**llm_kwargs)
 
-        # Sampling params with logprobs
-        self.sampling_params = SamplingParams(
+        # Sampling params (logprobs only when metrics enabled)
+        sp_kwargs = dict(
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
-            logprobs=self.logprobs_k,
         )
+        if not cfg.no_metrics:
+            sp_kwargs["logprobs"] = self.logprobs_k
+        self.sampling_params = SamplingParams(**sp_kwargs)
 
         print("Model loaded successfully.")
 
@@ -463,13 +470,25 @@ class VLLMInferenceRunner:
             token_ids = list(generation.token_ids)
             response = self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-            # Compute metrics from logprobs
-            metrics = compute_metrics_for_vllm_output(
-                logprobs=generation.logprobs,
-                token_ids=token_ids,
-                think_end_token_id=THINK_END_TOKEN_ID,
-                top_k_mass_k=self.cfg.top_k_mass_k,
-            )
+            # Compute metrics from logprobs (or skip if disabled)
+            if self.cfg.no_metrics:
+                metrics = {
+                    "avg_entropy_thinking": None,
+                    "avg_entropy_output": None,
+                    "avg_entropy": None,
+                    "avg_top_k_mass_thinking": None,
+                    "avg_top_k_mass_output": None,
+                    "avg_top_k_mass": None,
+                    "think_end_position": None,
+                    "num_tokens": len(token_ids),
+                }
+            else:
+                metrics = compute_metrics_for_vllm_output(
+                    logprobs=generation.logprobs,
+                    token_ids=token_ids,
+                    think_end_token_id=THINK_END_TOKEN_ID,
+                    top_k_mass_k=self.cfg.top_k_mass_k,
+                )
 
             results.append({
                 "persona": task.persona_info.persona,
@@ -854,6 +873,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of top logprobs for entropy computation (-1 for full vocab)",
     )
     parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        default=False,
+        help="Disable entropy/top-k-mass computation (vLLM only, skips logprobs for faster inference)",
+    )
+    parser.add_argument(
         "--thinking-mode",
         action="store_true",
         default=True,
@@ -928,6 +953,7 @@ def main() -> None:
         subset_category_persona=args.subset_category_persona,
         subset_prompt=args.subset_prompt,
         backend=args.backend,
+        no_metrics=args.no_metrics,
     )
 
     print(f"Configuration: {cfg.to_dict()}")

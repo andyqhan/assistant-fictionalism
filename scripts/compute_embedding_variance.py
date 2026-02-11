@@ -66,6 +66,15 @@ def main():
     else:
         prompt_to_question = {}
 
+    # Get prompt_id -> canonical_prompt_id mapping (if available)
+    has_canonical = "canonical_prompt_id" in df.columns
+    if has_canonical:
+        prompt_to_canonical = dict(
+            df[["prompt_id", "canonical_prompt_id"]].drop_duplicates().values
+        )
+    else:
+        prompt_to_canonical = {}
+
     # Get persona to category mapping (if available)
     if "category" in df.columns:
         persona_to_category = dict(
@@ -93,6 +102,8 @@ def main():
                 "total_variance": variance,
                 "n_samples": len(embeddings),
             }
+            if prompt_to_canonical:
+                result["canonical_prompt_id"] = prompt_to_canonical.get(prompt_id)
             if persona_to_category:
                 result["category"] = persona_to_category.get(persona, "unknown")
             results.append(result)

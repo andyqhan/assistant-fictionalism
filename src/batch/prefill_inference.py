@@ -112,6 +112,7 @@ class PrefillPrompt:
     category: str
     persona: str | None  # None = expand to all personas
     prompt_id: int
+    canonical_prompt_id: int | None = None  # shared across same prompt text
 
 
 @dataclass
@@ -173,6 +174,7 @@ def load_prefill_prompts(path: str) -> list[PrefillPrompt]:
                 category=obj["category"],
                 persona=obj.get("persona"),  # None if not specified
                 prompt_id=line_num,
+                canonical_prompt_id=obj.get("canonical_prompt_id"),
             ))
 
     assert len(prompts) > 0, "Prompts file must not be empty"
@@ -413,7 +415,7 @@ class VLLMPrefillRunner:
             token_ids = list(generation.token_ids)
             response = self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-            results.append({
+            result = {
                 "persona": task.persona.persona,
                 "category": task.prompt.category,
                 "prompt": task.prompt.prompt,
@@ -426,7 +428,10 @@ class VLLMPrefillRunner:
                 "num_tokens": len(token_ids),
                 "model": self.cfg.model,
                 "temperature": self.cfg.temperature,
-            })
+            }
+            if task.prompt.canonical_prompt_id is not None:
+                result["canonical_prompt_id"] = task.prompt.canonical_prompt_id
+            results.append(result)
 
         return results
 
@@ -626,7 +631,7 @@ class TransformersPrefillRunner:
 
             response = self.tokenizer.decode(tokens, skip_special_tokens=True)
 
-            results.append({
+            result = {
                 "persona": task.persona.persona,
                 "category": task.prompt.category,
                 "prompt": task.prompt.prompt,
@@ -639,7 +644,10 @@ class TransformersPrefillRunner:
                 "num_tokens": len(tokens),
                 "model": self.cfg.model,
                 "temperature": self.cfg.temperature,
-            })
+            }
+            if task.prompt.canonical_prompt_id is not None:
+                result["canonical_prompt_id"] = task.prompt.canonical_prompt_id
+            results.append(result)
 
         return results
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 
 @dataclass
@@ -127,10 +127,17 @@ class EmbeddingRunner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        # Load config and patch missing attributes for custom models
+        config = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)
+        if not hasattr(config, "rope_theta") or config.rope_theta is None:
+            config.rope_theta = 1000000.0
+            print(f"Patched missing rope_theta to {config.rope_theta}")
+
         # Load model with FlashAttention2 if available
         try:
             self.model = AutoModel.from_pretrained(
                 cfg.model,
+                config=config,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 attn_implementation="flash_attention_2",
@@ -141,6 +148,7 @@ class EmbeddingRunner:
             print(f"FlashAttention2 unavailable ({e}), using default attention")
             self.model = AutoModel.from_pretrained(
                 cfg.model,
+                config=config,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,

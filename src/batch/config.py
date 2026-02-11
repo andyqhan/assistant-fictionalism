@@ -21,6 +21,7 @@ class BatchInferenceConfig:
     subset_category_persona: float = 1.0
     subset_prompt: float = 1.0
     backend: str = "transformers"  # "transformers" or "vllm"
+    no_metrics: bool = False  # Skip logprobs/entropy/top-k-mass (vLLM only)
 
     def __post_init__(self) -> None:
         # Validate paths exist
@@ -37,7 +38,7 @@ class BatchInferenceConfig:
         assert self.n_reps > 0, f"n_reps must be positive, got {self.n_reps}"
         assert self.top_k_mass_k > 0, f"top_k_mass_k must be positive, got {self.top_k_mass_k}"
         # logprobs_k validation only applies to vLLM backend (transformers uses full vocab)
-        if self.backend == "vllm":
+        if self.backend == "vllm" and not self.no_metrics:
             assert self.logprobs_k > 0 or self.logprobs_k == -1, f"logprobs_k must be positive or -1, got {self.logprobs_k}"
             assert self.logprobs_k == -1 or self.logprobs_k >= self.top_k_mass_k, f"logprobs_k must be >= top_k_mass_k, got {self.logprobs_k} < {self.top_k_mass_k}"
         assert 0.0 < self.subset_category_persona <= 1.0, f"subset_category_persona must be in (0, 1], got {self.subset_category_persona}"
@@ -79,6 +80,7 @@ class BatchInferenceConfig:
             "subset_category_persona": self.subset_category_persona,
             "subset_prompt": self.subset_prompt,
             "backend": self.backend,
+            "no_metrics": self.no_metrics,
         }
 
     def to_comparable_dict(self) -> dict:
