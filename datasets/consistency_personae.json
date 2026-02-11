@@ -1,0 +1,9 @@
+[
+  {"persona": "assistant", "category": "assistant", "article": "an"},
+  {"persona": "helper", "category": "assistant-synonym", "article": "a"},
+  {"persona": "Eliezer Yudkowsky", "category": "famous", "article": "none"},
+  {"persona": "Hamlet", "category": "fictional-character", "article": "none"},
+  {"persona": "shoggoth", "category": "misc", "article": "a"},
+  {"persona": "Andy", "category": "unspecified-name", "article": "none"},
+  {"persona": "hermit", "category": "misc", "article": "a"}
+]
