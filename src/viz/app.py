@@ -1,11 +1,12 @@
 """
 Streamlit webapp for visualizing persona inference results.
 
-Supports four result types:
+Supports five result types:
 - metrics: entropy, top-k mass, thinking tokens from batch inference
 - judge: endorsement/flagged analysis from LLM judge
 - embeddings: embedding variance analysis from consistency experiments
 - tc_llm: TC-LLM label entropy analysis from clustering experiments
+- user_turn: user-turn prediction entropy, top-k mass, and token counts
 
 Run with:
     uv run streamlit run src/viz/app.py
@@ -40,13 +41,13 @@ st.set_page_config(
 
 
 def detect_result_type(file_path: Path) -> str:
-    """Detect if this is 'judge', 'metrics', 'embeddings', or 'tc_llm' results.
+    """Detect if this is 'judge', 'metrics', 'embeddings', 'tc_llm', or 'user_turn' results.
 
     Args:
         file_path: Path to the results file
 
     Returns:
-        'judge', 'metrics', 'embeddings', or 'tc_llm'
+        'judge', 'metrics', 'embeddings', 'tc_llm', or 'user_turn'
     """
     if file_path.suffix == ".parquet":
         return "embeddings"
@@ -86,7 +87,10 @@ def discover_result_files(logs_dir: str = "logs") -> list[tuple[Path, str]]:
         if judged.exists():
             result_files.append((judged, "judge"))
         elif jsonl.exists():
-            result_files.append((jsonl, "metrics"))
+            if dir_path.name.startswith("user-turn-prediction-"):
+                result_files.append((jsonl, "user_turn"))
+            else:
+                result_files.append((jsonl, "metrics"))
         elif json_file.exists():
             result_files.append((json_file, "metrics"))
 
@@ -135,6 +139,8 @@ def format_file_label(file_path: Path, result_type: str) -> str:
         return f"{dir_name} [judge]"
     elif result_type == "tc_llm":
         return f"{dir_name} [tc-llm]"
+    elif result_type == "user_turn":
+        return f"{dir_name} [user-turn]"
     else:
         return f"{dir_name} [metrics]"
 
@@ -2682,6 +2688,677 @@ def render_tc_llm_view(df: pd.DataFrame) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# User-Turn Prediction Visualization
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data
+def load_user_turn_data(file_path: str) -> pd.DataFrame:
+    """Load user-turn prediction results from JSONL into a DataFrame."""
+    data = []
+    with open(file_path) as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+    return pd.DataFrame(data)
+
+
+def _resolve_user_turn_metric_columns(df: pd.DataFrame) -> dict:
+    """Check whether thinking columns have data and return metric column info.
+
+    Returns:
+        dict with keys:
+            entropy_cols: list of entropy column names to use
+            top_k_cols: list of top-k mass column names to use
+            token_cols: list of token count column names to use
+            has_thinking: bool
+            metric_labels: dict mapping column name -> display label
+    """
+    # Check if thinking columns have any non-null data
+    thinking_cols = [
+        "response1_avg_entropy_thinking",
+        "response2_avg_entropy_thinking",
+    ]
+    has_thinking = any(
+        col in df.columns and df[col].notna().any() for col in thinking_cols
+    )
+
+    if has_thinking:
+        entropy_cols = [
+            "response1_avg_entropy_thinking",
+            "response1_avg_entropy_output",
+            "response1_avg_entropy",
+            "response2_avg_entropy_thinking",
+            "response2_avg_entropy_output",
+            "response2_avg_entropy",
+        ]
+        top_k_cols = [
+            "response1_avg_top_k_mass_thinking",
+            "response1_avg_top_k_mass_output",
+            "response1_avg_top_k_mass",
+            "response2_avg_top_k_mass_thinking",
+            "response2_avg_top_k_mass_output",
+            "response2_avg_top_k_mass",
+        ]
+        metric_labels = {
+            "response1_avg_entropy_thinking": "T1 Entropy (Thinking)",
+            "response1_avg_entropy_output": "T1 Entropy (Output)",
+            "response1_avg_entropy": "T1 Entropy (Overall)",
+            "response2_avg_entropy_thinking": "T2 Entropy (Thinking)",
+            "response2_avg_entropy_output": "T2 Entropy (Output)",
+            "response2_avg_entropy": "T2 Entropy (Overall)",
+            "response1_avg_top_k_mass_thinking": "T1 Top-k Mass (Thinking)",
+            "response1_avg_top_k_mass_output": "T1 Top-k Mass (Output)",
+            "response1_avg_top_k_mass": "T1 Top-k Mass (Overall)",
+            "response2_avg_top_k_mass_thinking": "T2 Top-k Mass (Thinking)",
+            "response2_avg_top_k_mass_output": "T2 Top-k Mass (Output)",
+            "response2_avg_top_k_mass": "T2 Top-k Mass (Overall)",
+            "response1_num_tokens": "T1 Tokens",
+            "response2_num_tokens": "T2 Tokens",
+        }
+    else:
+        entropy_cols = ["response1_avg_entropy", "response2_avg_entropy"]
+        top_k_cols = ["response1_avg_top_k_mass", "response2_avg_top_k_mass"]
+        metric_labels = {
+            "response1_avg_entropy": "Turn 1 Entropy",
+            "response2_avg_entropy": "Turn 2 Entropy",
+            "response1_avg_top_k_mass": "Turn 1 Top-k Mass",
+            "response2_avg_top_k_mass": "Turn 2 Top-k Mass",
+            "response1_num_tokens": "Turn 1 Tokens",
+            "response2_num_tokens": "Turn 2 Tokens",
+        }
+
+    token_cols = ["response1_num_tokens", "response2_num_tokens"]
+
+    return {
+        "entropy_cols": entropy_cols,
+        "top_k_cols": top_k_cols,
+        "token_cols": token_cols,
+        "has_thinking": has_thinking,
+        "metric_labels": metric_labels,
+    }
+
+
+def _create_mean_bar_chart(
+    melted: pd.DataFrame,
+    group_by: str,
+    y_col: str,
+    title: str,
+    y_label: str,
+    x_label: str,
+    metric_order: list[str],
+) -> go.Figure:
+    """Create grouped bar chart of means with SEM error bars from melted data."""
+    agg = (
+        melted.groupby([group_by, "metric"])[y_col]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+    agg["sem"] = agg["std"] / np.sqrt(agg["count"])
+
+    fig = px.bar(
+        agg,
+        x=group_by,
+        y="mean",
+        color="metric",
+        error_y="sem",
+        barmode="group",
+        title=title,
+        labels={"mean": y_label, group_by: x_label, "metric": "Turn / Section"},
+        category_orders={"metric": metric_order},
+    )
+    fig.update_layout(
+        xaxis_tickangle=-45,
+        height=900,
+    )
+    return fig
+
+
+def create_user_turn_entropy_chart(
+    df: pd.DataFrame,
+    group_by: str,
+    plot_type: str,
+    metric_info: dict,
+) -> go.Figure:
+    """Create box/violin/mean chart comparing Turn 1 vs Turn 2 entropy."""
+    assert group_by in ("category", "persona")
+    assert plot_type in ("box", "violin", "mean")
+
+    entropy_cols = metric_info["entropy_cols"]
+    labels = metric_info["metric_labels"]
+
+    id_vars = ["category", "persona", "prompt_id"]
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=entropy_cols,
+        var_name="metric",
+        value_name="entropy",
+    )
+    melted["metric"] = melted["metric"].map(labels)
+
+    x_label = "Persona Category" if group_by == "category" else "Persona"
+    metric_order = [labels[c] for c in entropy_cols]
+
+    if plot_type == "mean":
+        return _create_mean_bar_chart(
+            melted, group_by, "entropy",
+            title=f"Mean Entropy by {x_label} (Turn 1 vs Turn 2)",
+            y_label="Entropy", x_label=x_label, metric_order=metric_order,
+        )
+
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
+        melted,
+        x=group_by,
+        y="entropy",
+        color="metric",
+        title=f"Entropy by {x_label} (Turn 1 vs Turn 2)",
+        labels={"entropy": "Entropy", group_by: x_label, "metric": "Turn / Section"},
+        category_orders={"metric": metric_order},
+    )
+    mode_key = "violinmode" if plot_type == "violin" else "boxmode"
+    fig.update_layout(
+        **{mode_key: "group"},
+        xaxis_tickangle=-45,
+        height=900,
+    )
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
+    return fig
+
+
+def create_user_turn_top_k_mass_chart(
+    df: pd.DataFrame,
+    group_by: str,
+    plot_type: str,
+    metric_info: dict,
+) -> go.Figure:
+    """Create box/violin/mean chart comparing Turn 1 vs Turn 2 top-k mass."""
+    assert group_by in ("category", "persona")
+    assert plot_type in ("box", "violin", "mean")
+
+    top_k_cols = metric_info["top_k_cols"]
+    labels = metric_info["metric_labels"]
+
+    id_vars = ["category", "persona", "prompt_id"]
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=top_k_cols,
+        var_name="metric",
+        value_name="top_k_mass",
+    )
+    melted["metric"] = melted["metric"].map(labels)
+
+    x_label = "Persona Category" if group_by == "category" else "Persona"
+    metric_order = [labels[c] for c in top_k_cols]
+
+    if plot_type == "mean":
+        return _create_mean_bar_chart(
+            melted, group_by, "top_k_mass",
+            title=f"Mean Top-k Mass by {x_label} (Turn 1 vs Turn 2)",
+            y_label="Top-k Mass", x_label=x_label, metric_order=metric_order,
+        )
+
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
+        melted,
+        x=group_by,
+        y="top_k_mass",
+        color="metric",
+        title=f"Top-k Mass by {x_label} (Turn 1 vs Turn 2)",
+        labels={"top_k_mass": "Top-k Mass", group_by: x_label, "metric": "Turn / Section"},
+        category_orders={"metric": metric_order},
+    )
+    mode_key = "violinmode" if plot_type == "violin" else "boxmode"
+    fig.update_layout(
+        **{mode_key: "group"},
+        xaxis_tickangle=-45,
+        height=900,
+    )
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
+    return fig
+
+
+def create_user_turn_token_count_chart(
+    df: pd.DataFrame,
+    group_by: str,
+    plot_type: str,
+    metric_info: dict,
+) -> go.Figure:
+    """Create box/violin/mean chart comparing Turn 1 vs Turn 2 token counts."""
+    assert group_by in ("category", "persona")
+    assert plot_type in ("box", "violin", "mean")
+
+    token_cols = metric_info["token_cols"]
+    labels = metric_info["metric_labels"]
+
+    id_vars = ["category", "persona", "prompt_id"]
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=token_cols,
+        var_name="metric",
+        value_name="num_tokens",
+    )
+    melted["metric"] = melted["metric"].map(labels)
+
+    x_label = "Persona Category" if group_by == "category" else "Persona"
+    metric_order = [labels[c] for c in token_cols]
+
+    if plot_type == "mean":
+        return _create_mean_bar_chart(
+            melted, group_by, "num_tokens",
+            title=f"Mean Token Count by {x_label} (Turn 1 vs Turn 2)",
+            y_label="Number of Tokens", x_label=x_label, metric_order=metric_order,
+        )
+
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
+        melted,
+        x=group_by,
+        y="num_tokens",
+        color="metric",
+        title=f"Token Count by {x_label} (Turn 1 vs Turn 2)",
+        labels={"num_tokens": "Number of Tokens", group_by: x_label, "metric": "Turn"},
+        category_orders={"metric": metric_order},
+    )
+    mode_key = "violinmode" if plot_type == "violin" else "boxmode"
+    fig.update_layout(
+        **{mode_key: "group"},
+        xaxis_tickangle=-45,
+        height=900,
+    )
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
+    return fig
+
+
+def compute_user_turn_correlations(
+    df: pd.DataFrame, metric_info: dict
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute Pearson correlations across all numeric user-turn metrics.
+
+    Returns:
+        Tuple of (correlation_matrix, p_value_matrix)
+    """
+    all_cols = (
+        metric_info["entropy_cols"]
+        + metric_info["top_k_cols"]
+        + metric_info["token_cols"]
+    )
+    labels = metric_info["metric_labels"]
+
+    n = len(all_cols)
+    corr_matrix = np.zeros((n, n))
+    p_matrix = np.zeros((n, n))
+
+    for i, m1 in enumerate(all_cols):
+        for j, m2 in enumerate(all_cols):
+            if i == j:
+                corr_matrix[i, j] = 1.0
+                p_matrix[i, j] = 0.0
+            else:
+                valid_mask = df[m1].notna() & df[m2].notna()
+                if valid_mask.sum() > 2:
+                    r, p = stats.pearsonr(
+                        df.loc[valid_mask, m1], df.loc[valid_mask, m2]
+                    )
+                    corr_matrix[i, j] = r
+                    p_matrix[i, j] = p
+                else:
+                    corr_matrix[i, j] = np.nan
+                    p_matrix[i, j] = np.nan
+
+    display_labels = [labels[c] for c in all_cols]
+    corr_df = pd.DataFrame(corr_matrix, index=display_labels, columns=display_labels)
+    p_df = pd.DataFrame(p_matrix, index=display_labels, columns=display_labels)
+    return corr_df, p_df
+
+
+def compute_user_turn_statistical_tests(
+    df: pd.DataFrame, group_by: str, metric_col: str
+) -> tuple[float, float, pd.DataFrame, pd.DataFrame]:
+    """Kruskal-Wallis omnibus + pairwise Mann-Whitney U for a user-turn metric.
+
+    Args:
+        df: Filtered DataFrame
+        group_by: "category" or "persona"
+        metric_col: Column name to test
+
+    Returns:
+        (kw_stat, kw_p, p_df, r_df)
+    """
+    groups_list = sorted(df[group_by].unique())
+    group_data = {
+        g: df.loc[df[group_by] == g, metric_col].dropna().values
+        for g in groups_list
+    }
+    # Filter out empty groups
+    groups_list = [g for g in groups_list if len(group_data[g]) > 0]
+    group_data = {g: group_data[g] for g in groups_list}
+
+    # Kruskal-Wallis
+    if len(groups_list) >= 2:
+        kw_stat, kw_p = stats.kruskal(*[group_data[g] for g in groups_list])
+    else:
+        kw_stat, kw_p = np.nan, np.nan
+
+    # Pairwise Mann-Whitney U
+    n = len(groups_list)
+    p_matrix = np.full((n, n), np.nan)
+    r_matrix = np.full((n, n), np.nan)
+    for i in range(n):
+        for j in range(i + 1, n):
+            u_stat, p_val = stats.mannwhitneyu(
+                group_data[groups_list[i]],
+                group_data[groups_list[j]],
+                alternative="two-sided",
+            )
+            p_matrix[i, j] = p_val
+            p_matrix[j, i] = p_val
+            n1 = len(group_data[groups_list[i]])
+            n2 = len(group_data[groups_list[j]])
+            r_val = 1 - (2 * u_stat) / (n1 * n2)
+            r_matrix[i, j] = r_val
+            r_matrix[j, i] = -r_val
+
+    p_df = pd.DataFrame(p_matrix, index=groups_list, columns=groups_list)
+    r_df = pd.DataFrame(r_matrix, index=groups_list, columns=groups_list)
+    return kw_stat, kw_p, p_df, r_df
+
+
+def render_user_turn_stat_test_heatmaps(
+    p_df: pd.DataFrame,
+    r_df: pd.DataFrame,
+    kw_stat: float,
+    kw_p: float,
+    metric_label: str,
+) -> None:
+    """Render KW result line + side-by-side p-value and effect-size heatmaps."""
+    n = len(p_df)
+
+    if not np.isnan(kw_stat):
+        sig = "significant" if kw_p < 0.05 else "not significant"
+        st.markdown(
+            f"**{metric_label}** — Kruskal-Wallis: H={kw_stat:.2f}, "
+            f"p={kw_p:.2e} ({sig})"
+        )
+    else:
+        st.markdown(f"**{metric_label}** — insufficient groups for KW test")
+
+    col_p, col_r = st.columns(2)
+
+    with col_p:
+        fig_pw = go.Figure(data=go.Heatmap(
+            z=p_df.values,
+            x=p_df.columns.tolist(),
+            y=p_df.index.tolist(),
+            text=p_df.map(
+                lambda x: f"{x:.2e}" if pd.notna(x) else ""
+            ).values,
+            texttemplate="%{text}",
+            textfont={"size": 11},
+            colorscale=[[0, "#2ecc71"], [0.05, "#f1c40f"], [1, "#e74c3c"]],
+            zmin=0, zmax=1,
+            colorbar=dict(title="p-value"),
+        ))
+        fig_pw.update_layout(
+            title=f"P-values ({metric_label})",
+            height=400 + 30 * n,
+        )
+        st.plotly_chart(fig_pw, use_container_width=True)
+
+    with col_r:
+        fig_r = go.Figure(data=go.Heatmap(
+            z=r_df.values,
+            x=r_df.columns.tolist(),
+            y=r_df.index.tolist(),
+            text=r_df.map(
+                lambda x: f"{x:.3f}" if pd.notna(x) else ""
+            ).values,
+            texttemplate="%{text}",
+            textfont={"size": 11},
+            colorscale="RdBu_r",
+            zmid=0, zmin=-1, zmax=1,
+            colorbar=dict(title="r"),
+        ))
+        fig_r.update_layout(
+            title=f"Effect Size ({metric_label})",
+            height=400 + 30 * n,
+        )
+        st.plotly_chart(fig_r, use_container_width=True)
+
+
+def render_user_turn_view(df: pd.DataFrame) -> None:
+    """Render the user-turn prediction visualization view."""
+    metric_info = _resolve_user_turn_metric_columns(df)
+
+    # Sidebar info
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Dataset Info")
+    st.sidebar.write(f"Total samples: {len(df):,}")
+    st.sidebar.write(f"Categories: {df['category'].nunique()}")
+    st.sidebar.write(f"Personas: {df['persona'].nunique()}")
+    if "prompt_id" in df.columns:
+        st.sidebar.write(f"Prompts: {df['prompt_id'].nunique()}")
+
+    # Category filter
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filters")
+    categories = sorted(df["category"].unique())
+    selected_categories = st.sidebar.multiselect(
+        "Filter by category",
+        options=categories,
+        default=categories,
+        key="ut_category_filter",
+    )
+
+    if selected_categories:
+        filtered_df = df[df["category"].isin(selected_categories)]
+    else:
+        filtered_df = df
+
+    # View mode toggle
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("View Mode")
+    view_mode = st.sidebar.radio(
+        "Select view mode",
+        options=["All Personas", "Group by Category"],
+        index=0,
+        key="ut_view_mode",
+    )
+
+    chart_df = filtered_df
+    if view_mode == "Group by Category":
+        group_by = "category"
+    else:
+        group_by = "persona"
+
+    # Plot type toggle
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Chart Options")
+    plot_type = st.sidebar.radio(
+        "Plot type",
+        options=["Box", "Violin", "Mean"],
+        index=0,
+        horizontal=True,
+        key="ut_plot_type",
+    )
+    plot_type = plot_type.lower()
+
+    # Tabs
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "Entropy",
+        "Top-k Mass",
+        "Token Count",
+        "Correlations",
+        "Statistical Tests",
+        "Raw Data",
+    ])
+
+    with tab1:
+        st.plotly_chart(
+            create_user_turn_entropy_chart(chart_df, group_by, plot_type, metric_info),
+            use_container_width=True,
+        )
+        with st.expander("Summary Statistics"):
+            entropy_cols = metric_info["entropy_cols"]
+            labels = metric_info["metric_labels"]
+            stats_df = chart_df.groupby(group_by)[entropy_cols].agg(
+                ["mean", "std", "median"]
+            ).round(4)
+            stats_df.columns = [
+                f"{labels[col]} ({agg})"
+                for col, agg in stats_df.columns
+            ]
+            st.dataframe(stats_df, use_container_width=True)
+
+    with tab2:
+        st.plotly_chart(
+            create_user_turn_top_k_mass_chart(chart_df, group_by, plot_type, metric_info),
+            use_container_width=True,
+        )
+        with st.expander("Summary Statistics"):
+            top_k_cols = metric_info["top_k_cols"]
+            labels = metric_info["metric_labels"]
+            stats_df = chart_df.groupby(group_by)[top_k_cols].agg(
+                ["mean", "std", "median"]
+            ).round(4)
+            stats_df.columns = [
+                f"{labels[col]} ({agg})"
+                for col, agg in stats_df.columns
+            ]
+            st.dataframe(stats_df, use_container_width=True)
+
+    with tab3:
+        st.plotly_chart(
+            create_user_turn_token_count_chart(chart_df, group_by, plot_type, metric_info),
+            use_container_width=True,
+        )
+        with st.expander("Summary Statistics"):
+            token_cols = metric_info["token_cols"]
+            labels = metric_info["metric_labels"]
+            stats_df = chart_df.groupby(group_by)[token_cols].agg(
+                ["mean", "std", "median", "min", "max"]
+            ).round(2)
+            stats_df.columns = [
+                f"{labels[col]} ({agg})"
+                for col, agg in stats_df.columns
+            ]
+            st.dataframe(stats_df, use_container_width=True)
+
+    with tab4:
+        if view_mode == "Group by Category":
+            corr_title = "Metric Correlations (Grouped by Category)"
+        else:
+            corr_title = "Metric Correlations (All Personas)"
+
+        corr_df, p_df = compute_user_turn_correlations(chart_df, metric_info)
+        st.plotly_chart(
+            create_correlation_heatmap(corr_df, corr_title),
+            use_container_width=True,
+        )
+
+        st.subheader("Correlation Details")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Pearson Correlation Coefficients**")
+            st.dataframe(corr_df.round(4))
+        with col2:
+            st.markdown("**P-values**")
+
+            def format_pvalue(x):
+                if x == 0.0:
+                    return "< 1e-300"
+                elif x < 0.0001:
+                    return f"{x:.2e}"
+                else:
+                    return f"{x:.4f}"
+
+            st.dataframe(p_df.map(format_pvalue))
+
+        with st.expander("Interpretation Guide"):
+            st.markdown("""
+**Correlation Coefficient (r):**
+- **r = 1.0**: Perfect positive correlation
+- **r = 0.0**: No linear correlation
+- **r = -1.0**: Perfect negative correlation
+
+**Strength Guidelines:**
+- |r| < 0.3: Weak
+- 0.3 <= |r| < 0.7: Moderate
+- |r| >= 0.7: Strong
+
+**P-value:**
+- p < 0.05: Statistically significant
+- p < 0.01: Highly significant
+- p < 0.001: Very highly significant
+
+**Note:** Correlations are computed on the currently filtered data.
+            """)
+
+        st.info(f"Correlations computed on {len(chart_df):,} samples.")
+
+    with tab5:
+        st.subheader("Statistical Tests")
+        st.markdown(
+            "For each metric, a **Kruskal-Wallis** omnibus test checks whether "
+            "distributions differ significantly across groups overall (p < 0.05). "
+            "Pairwise **Mann-Whitney U** tests then compare each pair of groups. "
+            "The **rank-biserial correlation (r)** measures effect size:\n"
+            "- |r| < 0.1: negligible\n"
+            "- 0.1 - 0.3: small\n"
+            "- 0.3 - 0.5: medium\n"
+            "- |r| > 0.5: large"
+        )
+
+        all_metric_cols = (
+            metric_info["entropy_cols"]
+            + metric_info["top_k_cols"]
+            + metric_info["token_cols"]
+        )
+        labels = metric_info["metric_labels"]
+
+        groups_list = sorted(chart_df[group_by].unique())
+        if len(groups_list) < 2:
+            st.warning("Need at least 2 groups for statistical tests.")
+        else:
+            for col in all_metric_cols:
+                label = labels[col]
+                kw_stat, kw_p, p_df, r_df = compute_user_turn_statistical_tests(
+                    chart_df, group_by, col
+                )
+                render_user_turn_stat_test_heatmaps(
+                    p_df, r_df, kw_stat, kw_p, label
+                )
+                st.markdown("---")
+
+    with tab6:
+        st.subheader("Raw Data")
+        default_cols = [
+            "category", "persona", "prompt_id",
+            "response1_avg_entropy", "response2_avg_entropy",
+            "response1_avg_top_k_mass", "response2_avg_top_k_mass",
+            "response1_num_tokens", "response2_num_tokens",
+        ]
+        default_cols = [c for c in default_cols if c in chart_df.columns]
+        display_cols = st.multiselect(
+            "Select columns to display",
+            options=chart_df.columns.tolist(),
+            default=default_cols,
+            key="ut_raw_cols",
+        )
+        if display_cols:
+            st.dataframe(chart_df[display_cols], use_container_width=True)
+
+
 def main():
     st.title("Persona Experiment Results")
 
@@ -2695,7 +3372,8 @@ def main():
         st.error("No results files found in logs/ directory.")
         st.info(
             "Expected file patterns: logs/*/results.jsonl, results.json, "
-            "judged_results.jsonl, embedding_variance*.parquet, or tc_llm_groups.jsonl"
+            "judged_results.jsonl, embedding_variance*.parquet, or tc_llm_groups.jsonl. "
+            "User-turn prediction dirs (user-turn-prediction-*) are auto-detected."
         )
         return
 
@@ -2727,6 +3405,8 @@ def main():
                 df = load_multi_model_variance_data(str(file_path))
             elif result_type == "tc_llm":
                 df = load_tc_llm_data(str(file_path))
+            elif result_type == "user_turn":
+                df = load_user_turn_data(str(file_path))
             else:
                 df = load_results(file_path)
                 # Flatten judge_parsed if this is judge results
@@ -2740,6 +3420,8 @@ def main():
             render_embeddings_view(df)
         elif result_type == "tc_llm":
             render_tc_llm_view(df)
+        elif result_type == "user_turn":
+            render_user_turn_view(df)
         else:
             render_metrics_view(df)
 
