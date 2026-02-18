@@ -1787,7 +1787,66 @@ def render_metrics_view(df: pd.DataFrame) -> None:
             st.dataframe(chart_df[display_cols], use_container_width=True)
 
 
-def render_embeddings_view(df: pd.DataFrame) -> None:
+@st.cache_data
+def compute_umap_projection(
+    dir_path: str,
+    model_name: str,
+    embedding_col: str,
+    n_neighbors: int,
+    min_dist: float,
+) -> pd.DataFrame:
+    """Load raw embeddings and compute 2D UMAP projection.
+
+    Args:
+        dir_path: Directory containing embeddings_*.parquet files
+        model_name: Which embedding model to load (matches filename suffix)
+        embedding_col: Which embedding column to project ('embedding', 'embedding_thinking', 'embedding_output')
+        n_neighbors: UMAP n_neighbors parameter
+        min_dist: UMAP min_dist parameter
+
+    Returns:
+        DataFrame with columns: umap_x, umap_y, persona, category, prompt_id, prompt, rep_idx
+    """
+    import umap
+
+    parquet_path = Path(dir_path) / f"embeddings_{model_name}.parquet"
+    assert parquet_path.exists(), f"Raw embeddings not found: {parquet_path}"
+
+    # Load metadata + embedding column
+    meta_cols = ["persona", "category", "prompt_id", "rep_idx"]
+    schema = pq.read_schema(parquet_path)
+    available = set(schema.names)
+    meta_cols = [c for c in meta_cols if c in available]
+    if "prompt" in available:
+        meta_cols.append("prompt")
+
+    raw = pd.read_parquet(parquet_path, columns=meta_cols + [embedding_col])
+
+    # Drop rows where embedding is null
+    raw = raw[raw[embedding_col].notna()].reset_index(drop=True)
+    if len(raw) == 0:
+        return pd.DataFrame()
+
+    # Stack embeddings into numpy array
+    emb_matrix = np.stack(raw[embedding_col].values)
+
+    # Compute UMAP
+    reducer = umap.UMAP(
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        n_components=2,
+        metric="cosine",
+        random_state=42,
+    )
+    coords = reducer.fit_transform(emb_matrix)
+
+    result = raw[meta_cols].copy()
+    result["umap_x"] = coords[:, 0]
+    result["umap_y"] = coords[:, 1]
+    return result
+
+
+def render_embeddings_view(df: pd.DataFrame, dir_path: Path | None = None) -> None:
     """Render the embeddings variance visualization view.
 
     Supports single-model and multi-model data. When multiple models are present,
@@ -1795,6 +1854,7 @@ def render_embeddings_view(df: pd.DataFrame) -> None:
 
     Args:
         df: DataFrame loaded from embedding_variance*.parquet (with 'model' column)
+        dir_path: Directory containing the parquet files (used for UMAP tab)
     """
     # Find embedding columns and models
     embedding_columns = sorted(df["embedding_column"].unique())
@@ -1924,18 +1984,36 @@ def render_embeddings_view(df: pd.DataFrame) -> None:
     else:
         sort_model = active_models[0] if active_models else None
 
+    # Check if raw embeddings are available for UMAP
+    has_umap = False
+    raw_embedding_models: list[str] = []
+    if dir_path is not None:
+        raw_embedding_models = sorted(
+            f.stem.split("embeddings_", 1)[1]
+            for f in Path(dir_path).glob("embeddings_*.parquet")
+            if f.stem.startswith("embeddings_") and "variance" not in f.stem
+        )
+        has_umap = len(raw_embedding_models) > 0
+
     # Create tabs — show comparison tabs only when multiple models are active
+    tab_names = ["Variance by Persona"]
     if is_multi:
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Variance by Persona",
-            "Model Comparison",
-            "Model Agreement",
-            "Ranking Changes",
-        ])
+        tab_names += ["Model Comparison", "Model Agreement"]
+    tab_names.append("Ranking Changes")
+    if has_umap:
+        tab_names.append("UMAP")
+
+    tabs = st.tabs(tab_names)
+    tab_idx = 0
+    tab1 = tabs[tab_idx]; tab_idx += 1
+    if is_multi:
+        tab2 = tabs[tab_idx]; tab_idx += 1
+        tab3 = tabs[tab_idx]; tab_idx += 1
     else:
-        tab1, tab4 = st.tabs(["Variance by Persona", "Ranking Changes"])
         tab2 = None
         tab3 = None
+    tab4 = tabs[tab_idx]; tab_idx += 1
+    tab_umap = tabs[tab_idx] if has_umap else None
 
     # ---- Tab 1: Variance by Persona ----
     with tab1:
@@ -2110,6 +2188,100 @@ def render_embeddings_view(df: pd.DataFrame) -> None:
                     rank_stats.columns = ["Mean Rank", "Rank Std", "Best Rank", "Worst Rank"]
                     rank_stats = rank_stats.sort_values("Mean Rank")
                     st.dataframe(rank_stats, use_container_width=True)
+
+    # ---- UMAP Tab ----
+    if tab_umap is not None:
+        with tab_umap:
+            st.markdown("### UMAP Projection of Raw Embeddings")
+            st.caption(
+                "2D UMAP projection of raw embedding vectors. Each point is one "
+                "(persona, prompt, rep) sample. Colored by persona or category."
+            )
+
+            # UMAP controls
+            col_m, col_e, col_c = st.columns(3)
+            with col_m:
+                umap_model = st.selectbox(
+                    "Embedding model",
+                    options=raw_embedding_models,
+                    index=0,
+                    key="umap_model",
+                )
+            with col_e:
+                umap_emb_col = st.selectbox(
+                    "Embedding column",
+                    options=["embedding", "embedding_thinking", "embedding_output"],
+                    index=0,
+                    key="umap_emb_col",
+                )
+            with col_c:
+                umap_color = st.selectbox(
+                    "Color by",
+                    options=["persona", "category"],
+                    index=0,
+                    key="umap_color",
+                )
+
+            col_n, col_d = st.columns(2)
+            with col_n:
+                umap_n_neighbors = st.slider(
+                    "n_neighbors",
+                    min_value=5, max_value=200, value=15, step=5,
+                    key="umap_n_neighbors",
+                )
+            with col_d:
+                umap_min_dist = st.slider(
+                    "min_dist",
+                    min_value=0.0, max_value=1.0, value=0.1, step=0.05,
+                    key="umap_min_dist",
+                )
+
+            with st.spinner("Computing UMAP projection..."):
+                umap_df = compute_umap_projection(
+                    str(dir_path),
+                    umap_model,
+                    umap_emb_col,
+                    umap_n_neighbors,
+                    umap_min_dist,
+                )
+
+            if umap_df.empty:
+                st.warning(
+                    f"No data found for embedding column '{umap_emb_col}'. "
+                    "This column may be all null (e.g. thinking embeddings when thinking mode is off)."
+                )
+            else:
+                # Apply category/persona filters from sidebar
+                if selected_categories and "category" in umap_df.columns:
+                    umap_df = umap_df[umap_df["category"].isin(selected_categories)]
+                if selected_personas and "persona" in umap_df.columns:
+                    umap_df = umap_df[umap_df["persona"].isin(selected_personas)]
+
+                fig = px.scatter(
+                    umap_df,
+                    x="umap_x",
+                    y="umap_y",
+                    color=umap_color,
+                    color_discrete_map=color_map if umap_color == "category" else None,
+                    hover_data=[c for c in ["persona", "category", "prompt_id"] if c in umap_df.columns],
+                    title=f"UMAP — {umap_model} / {umap_emb_col}",
+                    labels={"umap_x": "UMAP 1", "umap_y": "UMAP 2"},
+                    opacity=0.6,
+                )
+                fig.update_traces(marker=dict(size=4))
+                fig.update_layout(
+                    height=800,
+                    legend=dict(
+                        orientation="v",
+                        yanchor="top",
+                        y=1.0,
+                        xanchor="left",
+                        x=1.02,
+                    ),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.info(f"Showing {len(umap_df):,} points.")
 
 
 @st.cache_data
@@ -3417,7 +3589,7 @@ def main():
         if result_type == "judge":
             render_judge_view(df)
         elif result_type == "embeddings":
-            render_embeddings_view(df)
+            render_embeddings_view(df, dir_path=file_path)
         elif result_type == "tc_llm":
             render_tc_llm_view(df)
         elif result_type == "user_turn":
