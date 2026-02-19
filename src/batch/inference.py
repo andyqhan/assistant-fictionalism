@@ -29,6 +29,7 @@ from .metrics import (
     compute_entropy_and_top_k_mass,
     compute_metrics_for_sequence,
     compute_metrics_for_vllm_output,
+    compute_section_summaries,
     compute_top_k_mass,
 )
 from .system_prompts import generate_system_prompt
@@ -472,16 +473,8 @@ class VLLMInferenceRunner:
 
             # Compute metrics from logprobs (or skip if disabled)
             if self.cfg.no_metrics:
-                metrics = {
-                    "avg_entropy_thinking": None,
-                    "avg_entropy_output": None,
-                    "avg_entropy": None,
-                    "avg_top_k_mass_thinking": None,
-                    "avg_top_k_mass_output": None,
-                    "avg_top_k_mass": None,
-                    "think_end_position": None,
-                    "num_tokens": len(token_ids),
-                }
+                metrics = compute_section_summaries([], [], [], [], THINK_END_TOKEN_ID)
+                metrics["num_tokens"] = len(token_ids)
             else:
                 metrics = compute_metrics_for_vllm_output(
                     logprobs=generation.logprobs,
@@ -649,6 +642,7 @@ class TransformersInferenceRunner:
         generated_tokens: list[list[int]] = [[] for _ in range(batch_size)]
         entropies: list[list[float]] = [[] for _ in range(batch_size)]
         top_k_masses: list[list[float]] = [[] for _ in range(batch_size)]
+        surprisals: list[list[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
         # Incremental generation with KV caching
@@ -683,6 +677,12 @@ class TransformersInferenceRunner:
                 else:
                     next_tokens = logits.argmax(dim=-1)
 
+                # Compute surprisal: -log p(chosen token)
+                step_log_probs = F.log_softmax(logits, dim=-1)
+                step_chosen_log_probs = step_log_probs.gather(
+                    1, next_tokens.unsqueeze(1)
+                ).squeeze(1)
+
                 # Store results per sequence (scalars only)
                 for i in range(batch_size):
                     if not finished[i]:
@@ -690,6 +690,7 @@ class TransformersInferenceRunner:
                         generated_tokens[i].append(token_id)
                         entropies[i].append(step_entropies[i].item())
                         top_k_masses[i].append(step_top_k[i].item())
+                        surprisals[i].append(-step_chosen_log_probs[i].item())
 
                         if token_id == self.tokenizer.eos_token_id:
                             finished[i] = True
@@ -705,38 +706,17 @@ class TransformersInferenceRunner:
             tokens = generated_tokens[i]
             ents = entropies[i]
             top_ks = top_k_masses[i]
+            surps = surprisals[i]
 
             # Trim EOS token if present
             if tokens and tokens[-1] == self.tokenizer.eos_token_id:
                 tokens = tokens[:-1]
                 ents = ents[:-1]
                 top_ks = top_ks[:-1]
-
-            # Find think_end position
-            think_end_pos = None
-            for j, tid in enumerate(tokens):
-                if tid == THINK_END_TOKEN_ID:
-                    think_end_pos = j
-                    break
-
-            # Compute averages for thinking/output sections
-            if think_end_pos is not None:
-                thinking_ents = ents[:think_end_pos + 1]
-                thinking_top_k = top_ks[:think_end_pos + 1]
-                output_ents = ents[think_end_pos + 1:]
-                output_top_k = top_ks[think_end_pos + 1:]
-
-                avg_entropy_thinking = sum(thinking_ents) / len(thinking_ents) if thinking_ents else None
-                avg_top_k_mass_thinking = sum(thinking_top_k) / len(thinking_top_k) if thinking_top_k else None
-                avg_entropy_output = sum(output_ents) / len(output_ents) if output_ents else None
-                avg_top_k_mass_output = sum(output_top_k) / len(output_top_k) if output_top_k else None
-            else:
-                avg_entropy_thinking = None
-                avg_top_k_mass_thinking = None
-                avg_entropy_output = sum(ents) / len(ents) if ents else None
-                avg_top_k_mass_output = sum(top_ks) / len(top_ks) if top_ks else None
+                surps = surps[:-1]
 
             response = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            metrics = compute_section_summaries(ents, top_ks, surps, tokens, THINK_END_TOKEN_ID)
 
             results.append({
                 "persona": task.persona_info.persona,
@@ -747,14 +727,7 @@ class TransformersInferenceRunner:
                 "prompt": task.prompt_info.question,
                 "rep_idx": task.rep_idx,
                 "response": response,
-                "avg_entropy_thinking": avg_entropy_thinking,
-                "avg_entropy_output": avg_entropy_output,
-                "avg_entropy": sum(ents) / len(ents) if ents else None,
-                "avg_top_k_mass_thinking": avg_top_k_mass_thinking,
-                "avg_top_k_mass_output": avg_top_k_mass_output,
-                "avg_top_k_mass": sum(top_ks) / len(top_ks) if top_ks else None,
-                "think_end_position": think_end_pos,
-                "num_tokens": len(tokens),
+                **metrics,
             })
 
         return results
@@ -869,7 +842,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logprobs-k",
         type=int,
-        default=10000,
+        default=20,
         help="Number of top logprobs for entropy computation (-1 for full vocab)",
     )
     parser.add_argument(

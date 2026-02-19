@@ -91,6 +91,104 @@ def compute_entropy_and_top_k_mass(
     return entropy, top_k_mass
 
 
+def summarize_values(values: list[float]) -> dict[str, float | None]:
+    """Compute summary statistics for a list of per-token values.
+
+    Returns dict with keys: avg, std, min, max.
+    All None if values is empty. Uses population standard deviation.
+    """
+    if not values:
+        return {"avg": None, "std": None, "min": None, "max": None}
+    n = len(values)
+    avg = sum(values) / n
+    std = (sum((v - avg) ** 2 for v in values) / n) ** 0.5
+    return {"avg": avg, "std": std, "min": min(values), "max": max(values)}
+
+
+def compute_section_summaries(
+    entropies: list[float],
+    top_k_masses: list[float],
+    surprisals: list[float],
+    token_ids: list[int],
+    think_end_token_id: int,
+) -> dict:
+    """Compute summary statistics for entropy, top-k mass, and surprisal, split by thinking/output.
+
+    Splits token-level values at the first </think> token into thinking and output
+    sections, then computes avg/std/min/max for each section and overall.
+    Perplexity is computed as exp(avg_surprisal) for each section.
+
+    Args:
+        entropies: Per-token entropy values.
+        top_k_masses: Per-token top-k mass values.
+        surprisals: Per-token surprisal values (-log p(chosen token)).
+        token_ids: Generated token IDs (used to find </think> boundary).
+        think_end_token_id: Token ID for </think>.
+
+    Returns:
+        Dictionary with {avg,std,min,max}_{entropy,top_k_mass,surprisal}_{thinking,output,},
+        perplexity_{thinking,output,}, plus think_end_position and num_tokens.
+    """
+    assert len(entropies) == len(top_k_masses) == len(surprisals) == len(token_ids)
+
+    if not token_ids:
+        result = {}
+        for stat in ("avg", "std", "min", "max"):
+            for metric in ("entropy", "top_k_mass", "surprisal"):
+                for suffix in ("_thinking", "_output", ""):
+                    result[f"{stat}_{metric}{suffix}"] = None
+        for suffix in ("_thinking", "_output", ""):
+            result[f"perplexity{suffix}"] = None
+        result["think_end_position"] = None
+        result["num_tokens"] = 0
+        return result
+
+    # Find </think> position
+    think_end_position = None
+    for i, tid in enumerate(token_ids):
+        if tid == think_end_token_id:
+            think_end_position = i
+            break
+
+    # Split into sections
+    if think_end_position is not None:
+        thinking_ents = entropies[: think_end_position + 1]
+        thinking_topk = top_k_masses[: think_end_position + 1]
+        thinking_surp = surprisals[: think_end_position + 1]
+        output_ents = entropies[think_end_position + 1 :]
+        output_topk = top_k_masses[think_end_position + 1 :]
+        output_surp = surprisals[think_end_position + 1 :]
+    else:
+        thinking_ents = []
+        thinking_topk = []
+        thinking_surp = []
+        output_ents = entropies
+        output_topk = top_k_masses
+        output_surp = surprisals
+
+    # Compute stats for each section
+    sections = {
+        "_thinking": (summarize_values(thinking_ents), summarize_values(thinking_topk), summarize_values(thinking_surp)),
+        "_output": (summarize_values(output_ents), summarize_values(output_topk), summarize_values(output_surp)),
+        "": (summarize_values(entropies), summarize_values(top_k_masses), summarize_values(surprisals)),
+    }
+
+    result = {}
+    for suffix, (ent_stats, topk_stats, surp_stats) in sections.items():
+        for stat in ("avg", "std", "min", "max"):
+            result[f"{stat}_entropy{suffix}"] = ent_stats[stat]
+            result[f"{stat}_top_k_mass{suffix}"] = topk_stats[stat]
+            result[f"{stat}_surprisal{suffix}"] = surp_stats[stat]
+        result[f"perplexity{suffix}"] = (
+            math.exp(surp_stats["avg"]) if surp_stats["avg"] is not None else None
+        )
+
+    result["think_end_position"] = think_end_position
+    result["num_tokens"] = len(token_ids)
+
+    return result
+
+
 def compute_metrics_for_sequence(
     logits_list: list[torch.Tensor],
     token_ids: list[int],
@@ -109,78 +207,26 @@ def compute_metrics_for_sequence(
         top_k: k value for top-k mass computation
 
     Returns:
-        Dictionary containing:
-            - avg_entropy_thinking: Average entropy for thinking tokens (or None)
-            - avg_entropy_output: Average entropy for output tokens (or None)
-            - avg_entropy: Average entropy for all tokens
-            - avg_top_k_mass_thinking: Average top-k mass for thinking (or None)
-            - avg_top_k_mass_output: Average top-k mass for output (or None)
-            - avg_top_k_mass: Average top-k mass for all tokens
-            - think_end_position: Position of </think> token (or None)
-            - num_tokens: Total number of generated tokens
+        Dictionary with summary statistics (see compute_section_summaries).
     """
     assert len(logits_list) == len(token_ids), (
         f"Logits/tokens length mismatch: {len(logits_list)} vs {len(token_ids)}"
     )
 
     if len(logits_list) == 0:
-        return {
-            "avg_entropy_thinking": None,
-            "avg_entropy_output": None,
-            "avg_entropy": None,
-            "avg_top_k_mass_thinking": None,
-            "avg_top_k_mass_output": None,
-            "avg_top_k_mass": None,
-            "think_end_position": None,
-            "num_tokens": 0,
-        }
+        return compute_section_summaries([], [], [], [], think_end_token_id)
 
-    # Stack logits for vectorized computation
     stacked_logits = torch.stack(logits_list)  # (seq_len, vocab_size)
+    entropies = compute_entropy(stacked_logits).tolist()
+    top_k_masses_vals = compute_top_k_mass(stacked_logits, top_k).tolist()
 
-    # Compute metrics for all tokens
-    entropies = compute_entropy(stacked_logits)  # (seq_len,)
-    top_k_masses = compute_top_k_mass(stacked_logits, top_k)  # (seq_len,)
+    # Compute surprisal: -log p(chosen token)
+    log_probs = F.log_softmax(stacked_logits, dim=-1)
+    token_ids_tensor = torch.tensor(token_ids, device=stacked_logits.device).unsqueeze(1)
+    chosen_log_probs = log_probs.gather(1, token_ids_tensor).squeeze(1)
+    surprisals = (-chosen_log_probs).tolist()
 
-    # Find </think> position
-    think_end_position = None
-    for i, tid in enumerate(token_ids):
-        if tid == think_end_token_id:
-            think_end_position = i
-            break
-
-    # Separate thinking and output metrics
-    if think_end_position is not None:
-        # Thinking tokens: indices 0 to think_end_position (inclusive)
-        thinking_entropies = entropies[: think_end_position + 1]
-        thinking_top_k = top_k_masses[: think_end_position + 1]
-
-        # Output tokens: indices after think_end_position
-        output_entropies = entropies[think_end_position + 1 :]
-        output_top_k = top_k_masses[think_end_position + 1 :]
-
-        avg_entropy_thinking = thinking_entropies.mean().item() if len(thinking_entropies) > 0 else None
-        avg_top_k_mass_thinking = thinking_top_k.mean().item() if len(thinking_top_k) > 0 else None
-
-        avg_entropy_output = output_entropies.mean().item() if len(output_entropies) > 0 else None
-        avg_top_k_mass_output = output_top_k.mean().item() if len(output_top_k) > 0 else None
-    else:
-        # No thinking section found - all tokens are output
-        avg_entropy_thinking = None
-        avg_top_k_mass_thinking = None
-        avg_entropy_output = entropies.mean().item()
-        avg_top_k_mass_output = top_k_masses.mean().item()
-
-    return {
-        "avg_entropy_thinking": avg_entropy_thinking,
-        "avg_entropy_output": avg_entropy_output,
-        "avg_entropy": entropies.mean().item(),
-        "avg_top_k_mass_thinking": avg_top_k_mass_thinking,
-        "avg_top_k_mass_output": avg_top_k_mass_output,
-        "avg_top_k_mass": top_k_masses.mean().item(),
-        "think_end_position": think_end_position,
-        "num_tokens": len(token_ids),
-    }
+    return compute_section_summaries(entropies, top_k_masses_vals, surprisals, token_ids, think_end_token_id)
 
 
 def compute_token_entropy_from_logprobs(token_logprobs: dict[int, Logprob]) -> float:
@@ -249,80 +295,21 @@ def compute_metrics_for_vllm_output(
         top_k_mass_k: k value for top-k mass computation
 
     Returns:
-        Dictionary containing:
-            - avg_entropy_thinking: Average entropy for thinking tokens (or None)
-            - avg_entropy_output: Average entropy for output tokens (or None)
-            - avg_entropy: Average entropy for all tokens
-            - avg_top_k_mass_thinking: Average top-k mass for thinking (or None)
-            - avg_top_k_mass_output: Average top-k mass for output (or None)
-            - avg_top_k_mass: Average top-k mass for all tokens
-            - think_end_position: Position of </think> token (or None)
-            - num_tokens: Total number of generated tokens
+        Dictionary with summary statistics (see compute_section_summaries).
     """
     if logprobs is None or len(logprobs) == 0:
-        return {
-            "avg_entropy_thinking": None,
-            "avg_entropy_output": None,
-            "avg_entropy": None,
-            "avg_top_k_mass_thinking": None,
-            "avg_top_k_mass_output": None,
-            "avg_top_k_mass": None,
-            "think_end_position": None,
-            "num_tokens": 0,
-        }
+        return compute_section_summaries([], [], [], [], think_end_token_id)
 
-    # Compute per-token metrics
     entropies = [compute_token_entropy_from_logprobs(lp) for lp in logprobs]
-    top_k_masses = [
+    top_k_masses_vals = [
         compute_token_top_k_mass_from_logprobs(lp, top_k_mass_k) for lp in logprobs
     ]
 
-    # Find </think> position
-    think_end_position = None
-    for i, tid in enumerate(token_ids):
-        if tid == think_end_token_id:
-            think_end_position = i
-            break
+    # Extract surprisal: -log p(chosen token)
+    # vLLM always includes the sampled token in the logprobs dict
+    surprisals = []
+    for lp_dict, tid in zip(logprobs, token_ids):
+        assert tid in lp_dict, f"Sampled token {tid} not found in logprobs dict"
+        surprisals.append(-lp_dict[tid].logprob)
 
-    # Separate thinking and output metrics
-    if think_end_position is not None:
-        # Thinking tokens: indices 0 to think_end_position (inclusive)
-        thinking_entropies = entropies[: think_end_position + 1]
-        thinking_top_k = top_k_masses[: think_end_position + 1]
-
-        # Output tokens: indices after think_end_position
-        output_entropies = entropies[think_end_position + 1 :]
-        output_top_k = top_k_masses[think_end_position + 1 :]
-
-        avg_entropy_thinking = (
-            sum(thinking_entropies) / len(thinking_entropies)
-            if thinking_entropies
-            else None
-        )
-        avg_top_k_mass_thinking = (
-            sum(thinking_top_k) / len(thinking_top_k) if thinking_top_k else None
-        )
-
-        avg_entropy_output = (
-            sum(output_entropies) / len(output_entropies) if output_entropies else None
-        )
-        avg_top_k_mass_output = (
-            sum(output_top_k) / len(output_top_k) if output_top_k else None
-        )
-    else:
-        # No thinking section found - all tokens are output
-        avg_entropy_thinking = None
-        avg_top_k_mass_thinking = None
-        avg_entropy_output = sum(entropies) / len(entropies)
-        avg_top_k_mass_output = sum(top_k_masses) / len(top_k_masses)
-
-    return {
-        "avg_entropy_thinking": avg_entropy_thinking,
-        "avg_entropy_output": avg_entropy_output,
-        "avg_entropy": sum(entropies) / len(entropies),
-        "avg_top_k_mass_thinking": avg_top_k_mass_thinking,
-        "avg_top_k_mass_output": avg_top_k_mass_output,
-        "avg_top_k_mass": sum(top_k_masses) / len(top_k_masses),
-        "think_end_position": think_end_position,
-        "num_tokens": len(token_ids),
-    }
+    return compute_section_summaries(entropies, top_k_masses_vals, surprisals, token_ids, think_end_token_id)

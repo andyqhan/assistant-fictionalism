@@ -14,7 +14,7 @@ class BatchInferenceConfig:
     batch_size: int = 64
     n_reps: int = 1
     top_k_mass_k: int = 5
-    logprobs_k: int = 10000  # -1 means full vocab (vLLM only)
+    logprobs_k: int = 20  # -1 means full vocab (vLLM only)
     thinking_mode: bool = True
     system_prompt_style: str = "you-are-a"
     output_dir: str = ""
