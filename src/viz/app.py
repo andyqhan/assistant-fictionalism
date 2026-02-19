@@ -3308,7 +3308,81 @@ def render_user_turn_stat_test_heatmaps(
         st.plotly_chart(fig_r, use_container_width=True)
 
 
-def render_user_turn_view(df: pd.DataFrame) -> None:
+def load_heuristic_tags(dir_path: Path, main_df: pd.DataFrame) -> pd.DataFrame | None:
+    """Load heuristic_tags.jsonl and merge category from main results DataFrame.
+
+    Returns:
+        DataFrame with heuristic tags + category column, or None if file missing.
+    """
+    tags_path = dir_path / "heuristic_tags.jsonl"
+    if not tags_path.exists():
+        return None
+
+    data = []
+    with open(tags_path) as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+
+    tags_df = pd.DataFrame(data)
+
+    # Merge category from main df
+    persona_to_category = (
+        main_df[["persona", "category"]]
+        .drop_duplicates()
+        .set_index("persona")["category"]
+        .to_dict()
+    )
+    tags_df["category"] = tags_df["persona"].map(persona_to_category)
+    return tags_df
+
+
+def create_heuristic_tags_chart(
+    tags_df: pd.DataFrame,
+    group_by: str,
+) -> go.Figure:
+    """Create a grouped bar chart showing heuristic tag rates by persona/category."""
+    tag_cols = {
+        "response1_repetitive_loop": ("Turn 1", "Repetitive Loop"),
+        "response1_intro_echo": ("Turn 1", "Intro Echo"),
+        "response1_max_tokens_hit": ("Turn 1", "Max Tokens Hit"),
+        "response2_repetitive_loop": ("Turn 2", "Repetitive Loop"),
+        "response2_intro_echo": ("Turn 2", "Intro Echo"),
+        "response2_max_tokens_hit": ("Turn 2", "Max Tokens Hit"),
+    }
+
+    rates = []
+    for col, (turn, tag) in tag_cols.items():
+        group_rates = tags_df.groupby(group_by)[col].mean() * 100
+        for group_name, rate in group_rates.items():
+            rates.append({
+                group_by: group_name,
+                "turn": turn,
+                "tag": tag,
+                "rate": rate,
+            })
+
+    rates_df = pd.DataFrame(rates)
+    x_label = "Persona" if group_by == "persona" else "Category"
+
+    fig = px.bar(
+        rates_df,
+        x=group_by,
+        y="rate",
+        color="tag",
+        facet_col="turn",
+        barmode="group",
+        title=f"Heuristic Tag Rates by {x_label}",
+        labels={"rate": "% of Responses", group_by: x_label, "tag": "Tag"},
+    )
+    fig.update_layout(
+        xaxis_tickangle=-45,
+        height=700,
+    )
+    return fig
+
+
+def render_user_turn_view(df: pd.DataFrame, dir_path: Path | None = None) -> None:
     """Render the user-turn prediction visualization view."""
     metric_info = _resolve_user_turn_metric_columns(df)
 
@@ -3366,14 +3440,37 @@ def render_user_turn_view(df: pd.DataFrame) -> None:
     plot_type = plot_type.lower()
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Entropy",
-        "Top-k Mass",
-        "Token Count",
-        "Correlations",
-        "Statistical Tests",
-        "Raw Data",
-    ])
+    # Check for optional data sources
+    has_umap = False
+    ut_embedding_files: list[str] = []
+    heuristic_tags_df: pd.DataFrame | None = None
+    if dir_path is not None:
+        ut_embedding_files = sorted(
+            f.stem.split("embeddings_", 1)[1]
+            for f in Path(dir_path).glob("embeddings_*.parquet")
+            if f.stem.startswith("embeddings_") and "variance" not in f.stem
+        )
+        has_umap = len(ut_embedding_files) > 0
+        heuristic_tags_df = load_heuristic_tags(Path(dir_path), df)
+
+    has_heuristic_tags = heuristic_tags_df is not None
+
+    tab_names = [
+        "Entropy", "Top-k Mass", "Token Count",
+        "Correlations", "Statistical Tests", "Raw Data",
+    ]
+    if has_heuristic_tags:
+        tab_names.append("Heuristic Tags")
+    if has_umap:
+        tab_names.append("UMAP")
+
+    tabs = st.tabs(tab_names)
+    tab1, tab2, tab3, tab4, tab5, tab6 = tabs[:6]
+    idx = 6
+    tab_heuristic = tabs[idx] if has_heuristic_tags else None
+    if has_heuristic_tags:
+        idx += 1
+    tab_umap = tabs[idx] if has_umap else None
 
     with tab1:
         st.plotly_chart(
@@ -3530,6 +3627,156 @@ def render_user_turn_view(df: pd.DataFrame) -> None:
         if display_cols:
             st.dataframe(chart_df[display_cols], use_container_width=True)
 
+    if tab_heuristic is not None:
+        with tab_heuristic:
+            assert heuristic_tags_df is not None
+            st.markdown("### Heuristic Degeneracy Tags")
+            st.caption(
+                "Programmatic tags detecting degenerate responses: "
+                "**Repetitive Loop** (most common word 5-gram appears 4+ times), "
+                "**Intro Echo** (response too similar to intro message), "
+                "**Max Tokens Hit** (response reached token limit)."
+            )
+
+            # Apply category filter to tags
+            if selected_categories and "category" in heuristic_tags_df.columns:
+                ht_df = heuristic_tags_df[heuristic_tags_df["category"].isin(selected_categories)]
+            else:
+                ht_df = heuristic_tags_df
+
+            st.plotly_chart(
+                create_heuristic_tags_chart(ht_df, group_by),
+                use_container_width=True,
+            )
+
+            # Summary table
+            with st.expander("Tag Rates by Persona"):
+                tag_bool_cols = [
+                    c for c in ht_df.columns if c.startswith("response") and c != "category"
+                ]
+                tag_bool_cols = [c for c in tag_bool_cols if ht_df[c].dtype == bool]
+                summary = ht_df.groupby("persona")[tag_bool_cols].mean().round(4) * 100
+                summary.columns = [
+                    c.replace("response1_", "T1 ").replace("response2_", "T2 ")
+                    .replace("_", " ").title()
+                    for c in summary.columns
+                ]
+                st.dataframe(
+                    summary.style.format("{:.1f}%"),
+                    use_container_width=True,
+                )
+
+            # Overall counts
+            total = len(ht_df)
+            any_degenerate_t1 = (
+                ht_df["response1_repetitive_loop"]
+                | ht_df["response1_intro_echo"]
+            ).sum()
+            any_degenerate_t2 = (
+                ht_df["response2_repetitive_loop"]
+                | ht_df["response2_intro_echo"]
+            ).sum()
+            st.info(
+                f"**{total:,}** records shown. "
+                f"Turn 1: **{any_degenerate_t1:,}** ({any_degenerate_t1/total*100:.1f}%) "
+                f"have repetitive loop or intro echo. "
+                f"Turn 2: **{any_degenerate_t2:,}** ({any_degenerate_t2/total*100:.1f}%) "
+                f"have repetitive loop or intro echo."
+            )
+
+    if tab_umap is not None:
+        with tab_umap:
+            st.markdown("### UMAP Projection of Response Embeddings")
+            st.caption(
+                "2D UMAP projection of response embedding vectors. Each point is one "
+                "sample. Colored by persona or category."
+            )
+
+            col_m, col_e, col_c = st.columns(3)
+            with col_m:
+                ut_umap_file = st.selectbox(
+                    "Embedding file",
+                    options=ut_embedding_files,
+                    index=0,
+                    key="ut_umap_file",
+                )
+            with col_e:
+                ut_umap_emb_col = st.selectbox(
+                    "Embedding column",
+                    options=["embedding", "embedding_thinking", "embedding_output"],
+                    index=0,
+                    key="ut_umap_emb_col",
+                )
+            with col_c:
+                ut_umap_color = st.selectbox(
+                    "Color by",
+                    options=["persona", "category"],
+                    index=0,
+                    key="ut_umap_color",
+                )
+
+            col_n, col_d = st.columns(2)
+            with col_n:
+                ut_umap_n_neighbors = st.slider(
+                    "n_neighbors",
+                    min_value=5, max_value=200, value=15, step=5,
+                    key="ut_umap_n_neighbors",
+                )
+            with col_d:
+                ut_umap_min_dist = st.slider(
+                    "min_dist",
+                    min_value=0.0, max_value=1.0, value=0.1, step=0.05,
+                    key="ut_umap_min_dist",
+                )
+
+            with st.spinner("Computing UMAP projection..."):
+                umap_df = compute_umap_projection(
+                    str(dir_path),
+                    ut_umap_file,
+                    ut_umap_emb_col,
+                    ut_umap_n_neighbors,
+                    ut_umap_min_dist,
+                )
+
+            if umap_df.empty:
+                st.warning(
+                    f"No data found for embedding column '{ut_umap_emb_col}'. "
+                    "This column may be all null (e.g. thinking embeddings when "
+                    "thinking mode is off)."
+                )
+            else:
+                # Apply category filter
+                if selected_categories and "category" in umap_df.columns:
+                    umap_df = umap_df[umap_df["category"].isin(selected_categories)]
+
+                fig = px.scatter(
+                    umap_df,
+                    x="umap_x",
+                    y="umap_y",
+                    color=ut_umap_color,
+                    hover_data=[
+                        c for c in ["persona", "category", "prompt_id"]
+                        if c in umap_df.columns
+                    ],
+                    title=f"UMAP — {ut_umap_file} / {ut_umap_emb_col}",
+                    labels={"umap_x": "UMAP 1", "umap_y": "UMAP 2"},
+                    opacity=0.6,
+                )
+                fig.update_traces(marker=dict(size=4))
+                fig.update_layout(
+                    height=800,
+                    legend=dict(
+                        orientation="v",
+                        yanchor="top",
+                        y=1.0,
+                        xanchor="left",
+                        x=1.02,
+                    ),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.info(f"Showing {len(umap_df):,} points.")
+
 
 def main():
     st.title("Persona Experiment Results")
@@ -3593,7 +3840,7 @@ def main():
         elif result_type == "tc_llm":
             render_tc_llm_view(df)
         elif result_type == "user_turn":
-            render_user_turn_view(df)
+            render_user_turn_view(df, dir_path=file_path.parent)
         else:
             render_metrics_view(df)
 
