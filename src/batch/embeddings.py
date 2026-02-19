@@ -28,6 +28,7 @@ class EmbeddingConfig:
     max_length: int = 8192
     pooling: str = "last_token"
     output: str = ""
+    response_column: str = "response"
 
     def __post_init__(self) -> None:
         # Validate input file exists
@@ -209,9 +210,14 @@ class EmbeddingRunner:
         print(f"Loaded {len(rows)} rows")
 
         # Extract texts for three embedding types
-        full_texts = [r["response"] for r in rows]
-        thinking_texts = [extract_thinking(r["response"]) for r in rows]
-        output_texts = [extract_output(r["response"]) for r in rows]
+        col = self.cfg.response_column
+        assert all(col in r for r in rows), (
+            f"Response column '{col}' not found in input data. "
+            f"Available columns: {list(rows[0].keys())}"
+        )
+        full_texts = [r[col] for r in rows]
+        thinking_texts = [extract_thinking(r[col]) for r in rows]
+        output_texts = [extract_output(r[col]) for r in rows]
 
         # Compute embeddings in batches
         embeddings_full = []
@@ -243,7 +249,7 @@ class EmbeddingRunner:
         for i, row in enumerate(rows):
             output_row = {
                 # Text columns for Embedding Atlas
-                "text": row["response"],
+                "text": row[col],
                 "text_thinking": thinking_texts[i],
                 "text_output": output_texts[i],
                 # Embedding columns
@@ -251,7 +257,7 @@ class EmbeddingRunner:
                 "embedding_thinking": embeddings_thinking[i],
                 "embedding_output": embeddings_output[i],
                 # Preserve all original metadata columns
-                **{k: v for k, v in row.items() if k != "response"},
+                **{k: v for k, v in row.items() if k != col},
             }
             output_rows.append(output_row)
 
@@ -312,6 +318,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Output parquet path (default: same dir as input)",
     )
+    parser.add_argument(
+        "--response-column",
+        type=str,
+        default="response",
+        help="Name of the JSON column containing response text to embed",
+    )
 
     return parser.parse_args()
 
@@ -327,6 +339,7 @@ def main() -> None:
         max_length=args.max_length,
         pooling=args.pooling,
         output=args.output,
+        response_column=args.response_column,
     )
 
     print(f"Configuration:")
@@ -336,6 +349,7 @@ def main() -> None:
     print(f"  Max length: {cfg.max_length}")
     print(f"  Pooling: {cfg.pooling}")
     print(f"  Output: {cfg.output}")
+    print(f"  Response column: {cfg.response_column}")
 
     runner = EmbeddingRunner(cfg)
     runner.run()
