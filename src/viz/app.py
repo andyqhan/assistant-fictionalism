@@ -1,12 +1,13 @@
 """
 Streamlit webapp for visualizing persona inference results.
 
-Supports five result types:
+Supports six result types:
 - metrics: entropy, top-k mass, thinking tokens from batch inference
 - judge: endorsement/flagged analysis from LLM judge
 - embeddings: embedding variance analysis from consistency experiments
 - tc_llm: TC-LLM label entropy analysis from clustering experiments
 - user_turn: user-turn prediction entropy, top-k mass, and token counts
+- model_comparison: scaling curves across multiple model sizes
 
 Run with:
     uv run streamlit run src/viz/app.py
@@ -105,6 +106,18 @@ def discover_result_files(logs_dir: str = "logs") -> list[tuple[Path, str]]:
         if tc_llm_groups.exists():
             result_files.append((tc_llm_groups, "tc_llm"))
 
+    # Check for model comparison manifests (JSON files with a "runs" key)
+    for json_path in sorted(logs_path.glob("*.json"), reverse=True):
+        if not json_path.is_file():
+            continue
+        try:
+            with open(json_path) as f:
+                manifest = json.load(f)
+            if isinstance(manifest, dict) and "runs" in manifest:
+                result_files.append((json_path, "model_comparison"))
+        except (json.JSONDecodeError, OSError):
+            continue
+
     return result_files
 
 
@@ -132,6 +145,15 @@ def format_file_label(file_path: Path, result_type: str) -> str:
             return f"{dir_name} [embeddings: {model_names[0]}]"
         else:
             return f"{dir_name} [embeddings: {len(model_names)} models]"
+
+    if result_type == "model_comparison":
+        try:
+            with open(file_path) as f:
+                manifest = json.load(f)
+            name = manifest.get("name", file_path.stem)
+        except (json.JSONDecodeError, OSError):
+            name = file_path.stem
+        return f"{name} [model-comparison]"
 
     dir_name = file_path.parent.name
 
@@ -1600,6 +1622,529 @@ def render_judge_view(df: pd.DataFrame) -> None:
         )
         if display_cols:
             st.dataframe(filtered_df[display_cols], use_container_width=True)
+
+
+# --- Model Comparison ---
+
+MODEL_COMPARISON_METRICS = {
+    "Entropy": {
+        "thinking": "avg_entropy_thinking",
+        "output": "avg_entropy_output",
+        "overall": "avg_entropy",
+    },
+    "Top-k Mass": {
+        "thinking": "avg_top_k_mass_thinking",
+        "output": "avg_top_k_mass_output",
+        "overall": "avg_top_k_mass",
+    },
+    "Surprisal": {
+        "thinking": "avg_surprisal_thinking",
+        "output": "avg_surprisal_output",
+        "overall": "avg_surprisal",
+    },
+    "Perplexity": {
+        "thinking": "perplexity_thinking",
+        "output": "perplexity_output",
+        "overall": "perplexity",
+    },
+}
+
+
+@st.cache_data
+def load_model_comparison_data(manifest_path: str) -> pd.DataFrame:
+    """Load and concatenate results from multiple model runs defined in a manifest.
+
+    Reads config.json from each run directory to extract the model name and size,
+    then loads results.jsonl and adds model/model_size_b columns.
+
+    Args:
+        manifest_path: Path to the manifest JSON file with a "runs" key.
+
+    Returns:
+        Concatenated DataFrame with model and model_size_b columns added.
+    """
+    import re
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    dfs = []
+    for run_dir in manifest["runs"]:
+        run_path = Path(run_dir)
+        assert run_path.exists(), f"Run directory not found: {run_path}"
+
+        # Read config to get model name
+        config_path = run_path / "config.json"
+        assert config_path.exists(), f"config.json not found in {run_path}"
+        with open(config_path) as f:
+            config = json.load(f)
+
+        # Extract short model name and numeric size
+        full_model = config["model"]  # e.g. "Qwen/Qwen3-8B"
+        short_model = full_model.split("/")[-1]  # e.g. "Qwen3-8B"
+        size_match = re.search(r"(\d+)B", short_model, re.IGNORECASE)
+        model_size_b = int(size_match.group(1)) if size_match else 0
+
+        # Load results
+        results_path = run_path / "results.jsonl"
+        assert results_path.exists(), f"results.jsonl not found in {run_path}"
+        data = []
+        with open(results_path) as f:
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line))
+        df = pd.DataFrame(data)
+
+        # Drop heavy text columns to save memory
+        drop_cols = [c for c in ["response", "system_prompt", "article"] if c in df.columns]
+        df = df.drop(columns=drop_cols)
+
+        df["model"] = short_model
+        df["model_size_b"] = model_size_b
+        dfs.append(df)
+
+    combined = pd.concat(dfs, ignore_index=True)
+    return combined
+
+
+def create_scaling_curves_chart(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_label: str,
+    color_map: dict[str, str],
+) -> go.Figure:
+    """Create line chart of mean metric vs model size, one line per category.
+
+    Args:
+        df: DataFrame with model_size_b, category, and metric columns.
+        metric_col: Column name for the metric to plot.
+        metric_label: Human-readable label for the y-axis.
+        color_map: Category -> color mapping.
+
+    Returns:
+        Plotly figure.
+    """
+    # Aggregate: mean and SEM per (model_size_b, category)
+    agg = (
+        df.groupby(["model_size_b", "model", "category"])[metric_col]
+        .agg(["mean", "sem", "count"])
+        .reset_index()
+    )
+
+    fig = go.Figure()
+    for category in sorted(agg["category"].unique()):
+        cat_df = agg[agg["category"] == category].sort_values("model_size_b")
+        fig.add_trace(go.Scatter(
+            x=cat_df["model_size_b"],
+            y=cat_df["mean"],
+            error_y=dict(type="data", array=cat_df["sem"].tolist(), visible=True),
+            mode="lines+markers",
+            name=category,
+            line=dict(color=color_map.get(category)),
+            marker=dict(size=8),
+        ))
+
+    # Build tick labels from data (e.g. "8B\nQwen3-8B")
+    model_info = (
+        df[["model_size_b", "model"]]
+        .drop_duplicates()
+        .sort_values("model_size_b")
+    )
+    fig.update_layout(
+        title=f"{metric_label} vs Model Size",
+        xaxis=dict(
+            title="Model Size",
+            tickvals=model_info["model_size_b"].tolist(),
+            ticktext=[f"{row.model_size_b}B" for row in model_info.itertuples()],
+            type="log",
+        ),
+        yaxis_title=metric_label,
+        height=600,
+        legend=dict(title="Category"),
+    )
+    return fig
+
+
+def create_gap_analysis_chart(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_label: str,
+    baseline_category: str,
+    color_map: dict[str, str],
+) -> go.Figure:
+    """Create line chart of (category mean - baseline mean) vs model size.
+
+    Args:
+        df: DataFrame with model_size_b, category, and metric columns.
+        metric_col: Column name for the metric.
+        metric_label: Human-readable metric label.
+        baseline_category: Category to use as the zero baseline.
+        color_map: Category -> color mapping.
+
+    Returns:
+        Plotly figure.
+    """
+    # Compute mean per (model_size_b, category)
+    means = (
+        df.groupby(["model_size_b", "model", "category"])[metric_col]
+        .mean()
+        .reset_index(name="mean")
+    )
+
+    # Get baseline means per model size
+    baseline = means[means["category"] == baseline_category][["model_size_b", "mean"]].rename(
+        columns={"mean": "baseline_mean"}
+    )
+    means = means.merge(baseline, on="model_size_b", how="left")
+    means["gap"] = means["mean"] - means["baseline_mean"]
+
+    fig = go.Figure()
+
+    model_sizes = sorted(means["model_size_b"].unique())
+
+    # Dashed baseline at y=0
+    fig.add_hline(
+        y=0, line_dash="dash", line_color="gray",
+        annotation_text=f"baseline ({baseline_category})",
+        annotation_position="bottom right",
+    )
+
+    for category in sorted(means["category"].unique()):
+        cat_df = means[means["category"] == category].sort_values("model_size_b")
+        fig.add_trace(go.Scatter(
+            x=cat_df["model_size_b"],
+            y=cat_df["gap"],
+            mode="lines+markers",
+            name=category,
+            line=dict(
+                color=color_map.get(category),
+                dash="dash" if category == baseline_category else "solid",
+            ),
+            marker=dict(size=8),
+        ))
+
+    model_info = (
+        df[["model_size_b", "model"]]
+        .drop_duplicates()
+        .sort_values("model_size_b")
+    )
+    fig.update_layout(
+        title=f"{metric_label} Gap from {baseline_category}",
+        xaxis=dict(
+            title="Model Size",
+            tickvals=model_info["model_size_b"].tolist(),
+            ticktext=[f"{row.model_size_b}B" for row in model_info.itertuples()],
+            type="log",
+        ),
+        yaxis_title=f"{metric_label} (difference from {baseline_category})",
+        height=600,
+        legend=dict(title="Category"),
+    )
+    return fig
+
+
+def create_model_category_heatmap_chart(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_label: str,
+    baseline_category: str,
+    show_gap: bool = False,
+) -> go.Figure:
+    """Create heatmap with rows=categories, columns=model sizes, values=mean metric.
+
+    Args:
+        df: DataFrame with model_size_b, model, category, and metric columns.
+        metric_col: Column name for the metric.
+        metric_label: Human-readable metric label.
+        baseline_category: Category used as baseline for gap mode.
+        show_gap: If True, show gap from baseline instead of raw values.
+
+    Returns:
+        Plotly figure.
+    """
+    # Pivot: category x model_size_b -> mean metric
+    means = (
+        df.groupby(["model_size_b", "model", "category"])[metric_col]
+        .mean()
+        .reset_index(name="mean")
+    )
+
+    model_info = (
+        means[["model_size_b", "model"]]
+        .drop_duplicates()
+        .sort_values("model_size_b")
+    )
+    model_labels = [f"{row.model} ({row.model_size_b}B)" for row in model_info.itertuples()]
+
+    pivot = means.pivot_table(
+        index="category", columns="model_size_b", values="mean", aggfunc="mean"
+    )
+    pivot = pivot[sorted(pivot.columns)]  # Sort columns by size
+
+    if show_gap:
+        if baseline_category in pivot.index:
+            baseline_row = pivot.loc[baseline_category]
+            pivot = pivot.subtract(baseline_row, axis="columns")
+        colorscale = "RdBu_r"
+        value_label = f"{metric_label} gap from {baseline_category}"
+        # Symmetric color range around 0
+        abs_max = max(abs(pivot.values.min()), abs(pivot.values.max()))
+        zmin, zmax = -abs_max, abs_max
+    else:
+        colorscale = "Viridis"
+        value_label = metric_label
+        zmin, zmax = None, None
+
+    # Sort categories alphabetically
+    pivot = pivot.sort_index()
+
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=model_labels,
+        y=pivot.index.tolist(),
+        colorscale=colorscale,
+        zmin=zmin,
+        zmax=zmax,
+        text=np.round(pivot.values, 4),
+        texttemplate="%{text}",
+        textfont=dict(size=11),
+        colorbar=dict(title=value_label),
+    ))
+
+    fig.update_layout(
+        title=f"{value_label} by Category and Model",
+        xaxis_title="Model",
+        yaxis_title="Category",
+        height=max(400, len(pivot) * 35 + 150),
+    )
+    return fig
+
+
+def create_distribution_comparison_chart(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_label: str,
+    plot_type: str = "box",
+) -> go.Figure:
+    """Create box/violin chart with x=category, y=metric, color=model.
+
+    Models are ordered by size (not alphabetically).
+
+    Args:
+        df: DataFrame with category, model, model_size_b, and metric columns.
+        metric_col: Column name for the metric.
+        metric_label: Human-readable metric label.
+        plot_type: "box" or "violin".
+
+    Returns:
+        Plotly figure.
+    """
+    assert plot_type in ("box", "violin"), f"Invalid plot_type: {plot_type}"
+
+    # Order models by size
+    model_order = (
+        df[["model", "model_size_b"]]
+        .drop_duplicates()
+        .sort_values("model_size_b")["model"]
+        .tolist()
+    )
+
+    plot_fn = px.violin if plot_type == "violin" else px.box
+    fig = plot_fn(
+        df,
+        x="category",
+        y=metric_col,
+        color="model",
+        title=f"{metric_label} Distribution by Category and Model",
+        labels={metric_col: metric_label, "category": "Category", "model": "Model"},
+        category_orders={"model": model_order},
+    )
+
+    mode_key = "violinmode" if plot_type == "violin" else "boxmode"
+    fig.update_layout(
+        **{mode_key: "group"},
+        xaxis_tickangle=-45,
+        height=700,
+    )
+    if plot_type == "violin":
+        fig.update_traces(meanline_visible=True)
+    else:
+        fig.update_traces(boxmean=True)
+    return fig
+
+
+def render_model_comparison_view(df: pd.DataFrame) -> None:
+    """Render the model comparison visualization view.
+
+    Args:
+        df: DataFrame with model, model_size_b, category, and metric columns.
+    """
+    # --- Sidebar ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Dataset Info")
+    model_counts = df.groupby("model").size()
+    for model_name in sorted(model_counts.index):
+        st.sidebar.write(f"{model_name}: {model_counts[model_name]:,} rows")
+    if model_counts.nunique() > 1:
+        st.sidebar.warning("Row counts differ across models (partial data).")
+    st.sidebar.write(f"Categories: {df['category'].nunique()}")
+    st.sidebar.write(f"Personas: {df['persona'].nunique()}")
+    st.sidebar.write(f"Prompts: {df['prompt_id'].nunique()}")
+
+    # Filters
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filters")
+    categories = sorted(df["category"].unique())
+    selected_categories = st.sidebar.multiselect(
+        "Filter by category",
+        options=categories,
+        default=categories,
+        key="mc_categories",
+    )
+    models = sorted(df["model"].unique(), key=lambda m: df[df["model"] == m]["model_size_b"].iloc[0])
+    selected_models = st.sidebar.multiselect(
+        "Filter by model",
+        options=models,
+        default=models,
+        key="mc_models",
+    )
+
+    # Configuration
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Configuration")
+    metric_family = st.sidebar.selectbox(
+        "Metric family",
+        options=list(MODEL_COMPARISON_METRICS.keys()),
+        key="mc_metric_family",
+    )
+    section = st.sidebar.radio(
+        "Section",
+        options=["Overall", "Thinking", "Output"],
+        index=0,
+        horizontal=True,
+        key="mc_section",
+    )
+    section_key = section.lower()  # "overall", "thinking", or "output"
+    metric_col = MODEL_COMPARISON_METRICS[metric_family][section_key]
+    metric_label = f"{metric_family} ({section})"
+
+    baseline_category = st.sidebar.selectbox(
+        "Baseline category",
+        options=categories,
+        index=categories.index("assistant") if "assistant" in categories else 0,
+        key="mc_baseline",
+    )
+    plot_type = st.sidebar.radio(
+        "Distribution plot type",
+        options=["Box", "Violin"],
+        index=0,
+        horizontal=True,
+        key="mc_plot_type",
+    ).lower()
+
+    restrict_shared = st.sidebar.checkbox(
+        "Restrict to shared (persona, prompt) pairs",
+        value=False,
+        key="mc_restrict_shared",
+        help="Only include (persona, prompt_id) pairs present in ALL selected models.",
+    )
+
+    # Apply filters
+    filtered_df = df[
+        df["category"].isin(selected_categories) & df["model"].isin(selected_models)
+    ]
+
+    if restrict_shared and len(selected_models) > 1:
+        # Find (persona, prompt_id) pairs present in every selected model
+        pairs_per_model = []
+        for model in selected_models:
+            model_df = filtered_df[filtered_df["model"] == model]
+            pairs = set(zip(model_df["persona"], model_df["prompt_id"]))
+            pairs_per_model.append(pairs)
+        shared_pairs = pairs_per_model[0]
+        for s in pairs_per_model[1:]:
+            shared_pairs = shared_pairs & s
+        if shared_pairs:
+            shared_df = pd.DataFrame(list(shared_pairs), columns=["persona", "prompt_id"])
+            filtered_df = filtered_df.merge(shared_df, on=["persona", "prompt_id"], how="inner")
+            st.sidebar.info(f"Restricted to {len(shared_pairs):,} shared (persona, prompt) pairs.")
+        else:
+            st.sidebar.warning("No shared (persona, prompt) pairs found across selected models.")
+
+    if filtered_df.empty:
+        st.warning("No data matches the current filters.")
+        return
+
+    # Drop rows where the selected metric is NaN
+    chart_df = filtered_df.dropna(subset=[metric_col])
+
+    color_map = build_category_color_map(chart_df)
+
+    # --- Tabs ---
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Scaling Curves", "Gap Analysis", "Heatmap", "Distributions", "Raw Data"]
+    )
+
+    with tab1:
+        st.plotly_chart(
+            create_scaling_curves_chart(chart_df, metric_col, metric_label, color_map),
+            use_container_width=True,
+        )
+        with st.expander("Summary Statistics"):
+            stats = (
+                chart_df.groupby(["model", "category"])[metric_col]
+                .agg(["mean", "std", "count"])
+                .round(4)
+            )
+            st.dataframe(stats)
+
+    with tab2:
+        st.plotly_chart(
+            create_gap_analysis_chart(
+                chart_df, metric_col, metric_label, baseline_category, color_map
+            ),
+            use_container_width=True,
+        )
+        with st.expander("Gap Values"):
+            means = chart_df.groupby(["model", "category"])[metric_col].mean().reset_index(name="mean")
+            baseline_means = means[means["category"] == baseline_category][["model", "mean"]].rename(
+                columns={"mean": "baseline_mean"}
+            )
+            gap_df = means.merge(baseline_means, on="model", how="left")
+            gap_df["gap"] = gap_df["mean"] - gap_df["baseline_mean"]
+            st.dataframe(
+                gap_df.pivot_table(index="category", columns="model", values="gap").round(4)
+            )
+
+    with tab3:
+        show_gap = st.checkbox("Show gap from baseline", value=False, key="mc_heatmap_gap")
+        st.plotly_chart(
+            create_model_category_heatmap_chart(
+                chart_df, metric_col, metric_label, baseline_category, show_gap
+            ),
+            use_container_width=True,
+        )
+
+    with tab4:
+        st.plotly_chart(
+            create_distribution_comparison_chart(chart_df, metric_col, metric_label, plot_type),
+            use_container_width=True,
+        )
+
+    with tab5:
+        st.subheader("Raw Data")
+        default_cols = [
+            c for c in ["model", "category", "persona", "prompt_id", metric_col]
+            if c in chart_df.columns
+        ]
+        display_cols = st.multiselect(
+            "Select columns to display",
+            options=chart_df.columns.tolist(),
+            default=default_cols,
+            key="mc_raw_cols",
+        )
+        if display_cols:
+            st.dataframe(chart_df[display_cols], use_container_width=True)
 
 
 def render_metrics_view(df: pd.DataFrame) -> None:
@@ -3820,7 +4365,9 @@ def main():
 
         # Load data
         with st.spinner("Loading results..."):
-            if result_type == "embeddings":
+            if result_type == "model_comparison":
+                df = load_model_comparison_data(str(file_path))
+            elif result_type == "embeddings":
                 df = load_multi_model_variance_data(str(file_path))
             elif result_type == "tc_llm":
                 df = load_tc_llm_data(str(file_path))
@@ -3833,7 +4380,9 @@ def main():
                     df = flatten_judge_parsed(df)
 
         # Render appropriate view based on result type
-        if result_type == "judge":
+        if result_type == "model_comparison":
+            render_model_comparison_view(df)
+        elif result_type == "judge":
             render_judge_view(df)
         elif result_type == "embeddings":
             render_embeddings_view(df, dir_path=file_path)
