@@ -365,10 +365,11 @@ class VLLMInferenceRunner:
         self.cfg = cfg
         self.output_dir = output_dir
 
-        print(f"Loading model {cfg.model} with vLLM...")
+        self.tokenizer_id = cfg.tokenizer or cfg.model
+        print(f"Loading model {cfg.model} with vLLM (tokenizer: {self.tokenizer_id})...")
 
         # Load tokenizer (still from transformers for chat template)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         assert self.tokenizer is not None, "Failed to load tokenizer"
 
         # Set up left padding for batching (used for chat template)
@@ -534,10 +535,11 @@ class TransformersInferenceRunner:
         self.cfg = cfg
         self.output_dir = output_dir
 
-        print(f"Loading model {cfg.model} with transformers + FlashAttention2...")
+        self.tokenizer_id = cfg.tokenizer or cfg.model
+        print(f"Loading model {cfg.model} with transformers + FlashAttention2 (tokenizer: {self.tokenizer_id})...")
 
         # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         assert self.tokenizer is not None, "Failed to load tokenizer"
 
         # Set up left padding for batching
@@ -810,6 +812,12 @@ def parse_args() -> argparse.Namespace:
         help="Model ID to use",
     )
     parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="",
+        help="Tokenizer model ID (defaults to --model if empty). Use to load a different tokenizer than the model, e.g. instruct tokenizer with base model weights.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -914,6 +922,7 @@ def main() -> None:
         prompts_json=args.prompts_json,
         personae_json=args.personae_json,
         model=args.model,
+        tokenizer=args.tokenizer,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         batch_size=args.batch_size,

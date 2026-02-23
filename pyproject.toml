@@ -17,6 +17,8 @@ dependencies = [
     "vllm>=0.6.0",
     "matplotlib>=3.10.8",
     "umap-learn>=0.5.11",
+    "seaborn",
+    "statsmodels",
 ]
 
 [build-system]

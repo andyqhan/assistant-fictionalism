@@ -120,6 +120,7 @@ class UserTurnPredictionConfig:
     prompts_jsonl: str
     personae_json: str
     model: str = "Qwen/Qwen3-4B-Instruct-2507"
+    tokenizer: str = ""  # Tokenizer model ID (defaults to model if empty)
     temperature: float = 0.7
     max_tokens: int = 512
     batch_size: int = 256
@@ -166,6 +167,7 @@ class UserTurnPredictionConfig:
             "prompts_jsonl": self.prompts_jsonl,
             "personae_json": self.personae_json,
             "model": self.model,
+            "tokenizer": self.tokenizer,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "batch_size": self.batch_size,
@@ -389,10 +391,11 @@ class UserTurnPredictionRunner:
         self.cfg = cfg
         self.output_dir = output_dir
 
-        print(f"Loading model {cfg.model} with transformers + FlashAttention2...")
+        self.tokenizer_id = cfg.tokenizer or cfg.model
+        print(f"Loading model {cfg.model} with transformers + FlashAttention2 (tokenizer: {self.tokenizer_id})...")
 
         # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
         assert self.tokenizer is not None, "Failed to load tokenizer"
         assert hasattr(self.tokenizer, "chat_template"), "Tokenizer must have chat_template attribute"
 
@@ -765,6 +768,12 @@ def parse_args() -> argparse.Namespace:
         help="Model ID to use",
     )
     parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="",
+        help="Tokenizer model ID (defaults to --model if empty). Use to load a different tokenizer than the model, e.g. instruct tokenizer with base model weights.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.7,
@@ -850,6 +859,7 @@ def main() -> None:
         prompts_jsonl=args.prompts_jsonl,
         personae_json=args.personae_json,
         model=args.model,
+        tokenizer=args.tokenizer,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         batch_size=args.batch_size,

@@ -9,6 +9,7 @@ class BatchInferenceConfig:
     prompts_json: str
     personae_json: str
     model: str = "Qwen/Qwen3-8B"
+    tokenizer: str = ""  # Tokenizer model ID (defaults to model if empty)
     temperature: float = 0.0
     max_tokens: int = 1024
     batch_size: int = 64
@@ -68,6 +69,7 @@ class BatchInferenceConfig:
             "prompts_json": self.prompts_json,
             "personae_json": self.personae_json,
             "model": self.model,
+            "tokenizer": self.tokenizer,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "batch_size": self.batch_size,
