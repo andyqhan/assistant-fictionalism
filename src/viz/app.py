@@ -4333,6 +4333,24 @@ def render_user_turn_view(df: pd.DataFrame, dir_path: Path | None = None) -> Non
 # ---------------------------------------------------------------------------
 
 
+def _model_sort_key(model_name: str) -> tuple[float, str]:
+    """Sort key that orders model names by parameter count (smallest first).
+
+    Extracts the number before 'B' in names like 'Qwen/Qwen3-14B'.
+    Falls back to alphabetical for non-matching names.
+    """
+    import re
+    match = re.search(r"(\d+(?:\.\d+)?)B", model_name, re.IGNORECASE)
+    if match:
+        return (float(match.group(1)), model_name)
+    return (float("inf"), model_name)
+
+
+def _sorted_models(models) -> list[str]:
+    """Return model names sorted by parameter count (smallest first)."""
+    return sorted(models, key=_model_sort_key)
+
+
 def compute_coin_flip_bias(df: pd.DataFrame) -> pd.DataFrame:
     """Pivot raw coin-flip results into one row per (persona, run_id) with bias score.
 
@@ -4684,8 +4702,13 @@ def render_coin_flip_view(df: pd.DataFrame) -> None:
         df["p_tails_normalized"],
     )
 
+    # Order models by parameter count (smallest first)
+    model_order = _sorted_models(df["model"].unique())
+    df["model"] = pd.Categorical(df["model"], categories=model_order, ordered=True)
+
     # Compute bias DataFrame
     bias_df = compute_coin_flip_bias(df)
+    bias_df["model"] = pd.Categorical(bias_df["model"], categories=model_order, ordered=True)
 
     # Add p_preferred_mean to bias_df
     bias_df["p_preferred_mean"] = (
@@ -4724,7 +4747,7 @@ def render_coin_flip_view(df: pd.DataFrame) -> None:
     st.sidebar.subheader("Filters")
 
     if multi_run:
-        all_models = sorted(df["model"].unique().tolist())
+        all_models = _sorted_models(df["model"].unique())
         selected_models = st.sidebar.multiselect(
             "Filter by model",
             options=all_models,
