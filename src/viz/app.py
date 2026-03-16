@@ -1,13 +1,14 @@
 """
 Streamlit webapp for visualizing persona inference results.
 
-Supports six result types:
+Supports seven result types:
 - metrics: entropy, top-k mass, thinking tokens from batch inference
 - judge: endorsement/flagged analysis from LLM judge
 - embeddings: embedding variance analysis from consistency experiments
 - tc_llm: TC-LLM label entropy analysis from clustering experiments
 - user_turn: user-turn prediction entropy, top-k mass, and token counts
 - model_comparison: scaling curves across multiple model sizes
+- coin_flip: coin flip bias analysis across personas
 
 Run with:
     uv run streamlit run src/viz/app.py
@@ -90,6 +91,8 @@ def discover_result_files(logs_dir: str = "logs") -> list[tuple[Path, str]]:
         elif jsonl.exists():
             if dir_path.name.startswith("user-turn-prediction-"):
                 result_files.append((jsonl, "user_turn"))
+            elif dir_path.name.startswith("coin-flip-"):
+                result_files.append((jsonl, "coin_flip"))
             else:
                 result_files.append((jsonl, "metrics"))
         elif json_file.exists():
@@ -163,6 +166,8 @@ def format_file_label(file_path: Path, result_type: str) -> str:
         return f"{dir_name} [tc-llm]"
     elif result_type == "user_turn":
         return f"{dir_name} [user-turn]"
+    elif result_type == "coin_flip":
+        return f"{dir_name} [coin-flip]"
     else:
         return f"{dir_name} [metrics]"
 
@@ -4323,6 +4328,602 @@ def render_user_turn_view(df: pd.DataFrame, dir_path: Path | None = None) -> Non
                 st.info(f"Showing {len(umap_df):,} points.")
 
 
+# ---------------------------------------------------------------------------
+# Coin Flip Experiment Visualization
+# ---------------------------------------------------------------------------
+
+
+def compute_coin_flip_bias(df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot raw coin-flip results into one row per (persona, run_id) with bias score.
+
+    Args:
+        df: Raw coin-flip DataFrame with two rows per persona per run
+            (ordering = "preferred_heads" | "preferred_tails").
+
+    Returns:
+        DataFrame with columns: persona, category, article, model, run_id,
+        use_tasks_from, p_heads_norm_pref_heads, p_heads_norm_pref_tails,
+        bias, entropy_pref_heads, entropy_pref_tails, entropy_mean.
+    """
+    group_keys = ["persona", "run_id"]
+    counts = df.groupby(group_keys).size()
+    bad = counts[counts != 2]
+    assert bad.empty, f"Expected exactly 2 rows per (persona, run_id), got:\n{bad}"
+
+    pref_heads = df[df["ordering"] == "preferred_heads"].set_index(group_keys)
+    pref_tails = df[df["ordering"] == "preferred_tails"].set_index(group_keys)
+
+    bias_df = pd.DataFrame({
+        "p_heads_norm_pref_heads": pref_heads["p_heads_normalized"],
+        "p_heads_norm_pref_tails": pref_tails["p_heads_normalized"],
+        "entropy_pref_heads": pref_heads["entropy"],
+        "entropy_pref_tails": pref_tails["entropy"],
+        "category": pref_heads["category"],
+        "article": pref_heads["article"],
+        "model": pref_heads["model"],
+    })
+    bias_df["bias"] = bias_df["p_heads_norm_pref_heads"] - bias_df["p_heads_norm_pref_tails"]
+    bias_df["entropy_mean"] = (
+        bias_df["entropy_pref_heads"] + bias_df["entropy_pref_tails"]
+    ) / 2
+
+    # Carry use_tasks_from (may be None)
+    if "use_tasks_from" in pref_heads.columns:
+        bias_df["use_tasks_from"] = pref_heads["use_tasks_from"]
+
+    bias_df = bias_df.reset_index()
+    return bias_df
+
+
+def create_coin_flip_bias_box(
+    bias_df: pd.DataFrame,
+    group_by: str,
+    plot_type: str,
+    color_map: dict[str, str],
+    multi_run: bool,
+) -> go.Figure:
+    """Box/violin + strip of bias scores grouped by category or persona."""
+    chart_fn = px.violin if plot_type == "violin" else px.box
+    kwargs = {}
+    if plot_type != "violin":
+        kwargs["points"] = "all"
+    else:
+        kwargs["points"] = "all"
+        kwargs["box"] = True
+
+    if multi_run:
+        fig = chart_fn(
+            bias_df, x=group_by, y="bias", color="model",
+            title=f"Coin Flip Bias by {group_by.title()}",
+            labels={"bias": "Bias (positive = favors preferred)", group_by: group_by.title()},
+            **kwargs,
+        )
+    else:
+        fig = chart_fn(
+            bias_df, x=group_by, y="bias",
+            color=group_by if group_by == "category" else None,
+            color_discrete_map=color_map if group_by == "category" else None,
+            title=f"Coin Flip Bias by {group_by.title()}",
+            labels={"bias": "Bias (positive = favors preferred)", group_by: group_by.title()},
+            **kwargs,
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="no bias")
+    fig.update_layout(height=600, xaxis_tickangle=-45, showlegend=True)
+    return fig
+
+
+def create_coin_flip_bias_bar(
+    bias_df: pd.DataFrame,
+    color_map: dict[str, str],
+    multi_run: bool,
+) -> go.Figure:
+    """Sorted bar chart of per-persona bias scores."""
+    sorted_df = bias_df.sort_values("bias", ascending=True)
+
+    if multi_run:
+        fig = px.bar(
+            sorted_df, x="bias", y="persona", color="model",
+            orientation="h", barmode="group",
+            title="Per-Persona Bias (sorted)",
+            labels={"bias": "Bias", "persona": "Persona"},
+        )
+    else:
+        fig = px.bar(
+            sorted_df, x="bias", y="persona", color="category",
+            color_discrete_map=color_map,
+            orientation="h",
+            title="Per-Persona Bias (sorted)",
+            labels={"bias": "Bias", "persona": "Persona"},
+        )
+
+    fig.add_vline(x=0, line_dash="dash", line_color="gray")
+    n = len(sorted_df)
+    fig.update_layout(height=max(600, 18 * n), yaxis=dict(dtick=1))
+    return fig
+
+
+def create_coin_flip_dumbbell(
+    df: pd.DataFrame,
+    group_by: str,
+    color_map: dict[str, str],
+    multi_run: bool,
+) -> go.Figure:
+    """Dumbbell chart showing p_heads_normalized for both orderings."""
+    if group_by == "category":
+        # Aggregate to category means
+        agg = df.groupby(["category", "ordering"]).agg(
+            p_heads_normalized=("p_heads_normalized", "mean"),
+        ).reset_index()
+        label_col = "category"
+    else:
+        agg = df[["persona", "category", "ordering", "p_heads_normalized"]].copy()
+        label_col = "persona"
+
+    # Sort by bias (preferred_heads - preferred_tails)
+    ph = agg[agg["ordering"] == "preferred_heads"].set_index(label_col)["p_heads_normalized"]
+    pt = agg[agg["ordering"] == "preferred_tails"].set_index(label_col)["p_heads_normalized"]
+    bias = (ph - pt).sort_values()
+    ordered_labels = bias.index.tolist()
+
+    fig = go.Figure()
+
+    # Draw connecting lines
+    for label in ordered_labels:
+        h_val = ph.get(label, None)
+        t_val = pt.get(label, None)
+        if h_val is not None and t_val is not None:
+            color = "#3498db" if h_val > t_val else "#e74c3c"
+            fig.add_trace(go.Scatter(
+                x=[h_val, t_val], y=[label, label],
+                mode="lines", line=dict(color=color, width=2),
+                showlegend=False, hoverinfo="skip",
+            ))
+
+    # Draw points
+    for ordering, marker_symbol, color, name in [
+        ("preferred_heads", "circle", "#2ecc71", "Preferred = Heads"),
+        ("preferred_tails", "diamond", "#e74c3c", "Preferred = Tails"),
+    ]:
+        subset = agg[agg["ordering"] == ordering]
+        # Reorder to match sorted labels
+        subset = subset.set_index(label_col).reindex(ordered_labels).reset_index()
+        fig.add_trace(go.Scatter(
+            x=subset["p_heads_normalized"], y=subset[label_col],
+            mode="markers",
+            marker=dict(size=10, symbol=marker_symbol, color=color),
+            name=name,
+            hovertemplate=f"{label_col}: %{{y}}<br>p(heads): %{{x:.4f}}<extra>{name}</extra>",
+        ))
+
+    fig.add_vline(x=0.5, line_dash="dash", line_color="gray", annotation_text="fair coin")
+    n = len(ordered_labels)
+    fig.update_layout(
+        title=f"Paired p(heads) by {group_by.title()} (sorted by bias)",
+        xaxis_title="p(heads) normalized",
+        height=max(600, 22 * n),
+        yaxis=dict(dtick=1, categoryorder="array", categoryarray=ordered_labels),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
+def create_coin_flip_entropy_box(
+    df: pd.DataFrame,
+    group_by: str,
+    plot_type: str,
+    color_map: dict[str, str],
+    multi_run: bool,
+) -> go.Figure:
+    """Box/violin of entropy by group."""
+    chart_fn = px.violin if plot_type == "violin" else px.box
+    kwargs = {"points": "all"}
+    if plot_type == "violin":
+        kwargs["box"] = True
+
+    if multi_run:
+        fig = chart_fn(
+            df, x=group_by, y="entropy", color="model",
+            title=f"Full-Vocab Entropy by {group_by.title()}",
+            labels={"entropy": "Entropy (nats)", group_by: group_by.title()},
+            **kwargs,
+        )
+    else:
+        fig = chart_fn(
+            df, x=group_by, y="entropy",
+            color=group_by if group_by == "category" else None,
+            color_discrete_map=color_map if group_by == "category" else None,
+            title=f"Full-Vocab Entropy by {group_by.title()}",
+            labels={"entropy": "Entropy (nats)", group_by: group_by.title()},
+            **kwargs,
+        )
+
+    fig.update_layout(height=600, xaxis_tickangle=-45)
+    return fig
+
+
+def create_coin_flip_entropy_vs_bias(
+    bias_df: pd.DataFrame,
+    color_map: dict[str, str],
+    multi_run: bool,
+) -> go.Figure:
+    """Scatter of mean entropy vs bias, colored by category."""
+    if multi_run:
+        fig = px.scatter(
+            bias_df, x="entropy_mean", y="bias",
+            color="model", symbol="category",
+            trendline="ols",
+            title="Entropy vs Bias",
+            labels={"entropy_mean": "Mean Entropy (nats)", "bias": "Bias"},
+            hover_data=["persona", "category"],
+        )
+    else:
+        fig = px.scatter(
+            bias_df, x="entropy_mean", y="bias",
+            color="category", color_discrete_map=color_map,
+            trendline="ols",
+            title="Entropy vs Bias",
+            labels={"entropy_mean": "Mean Entropy (nats)", "bias": "Bias"},
+            hover_data=["persona"],
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.update_layout(height=600)
+    return fig
+
+
+def compute_coin_flip_one_sample_tests(
+    bias_values: np.ndarray,
+) -> dict:
+    """One-sample Wilcoxon + t-test on bias against 0."""
+    n = len(bias_values)
+    mean_bias = float(np.mean(bias_values))
+    std_bias = float(np.std(bias_values, ddof=1)) if n > 1 else 0.0
+
+    # t-test
+    if n > 1 and std_bias > 0:
+        t_stat, t_p = stats.ttest_1samp(bias_values, 0)
+        cohens_d = mean_bias / std_bias
+        se = std_bias / np.sqrt(n)
+        ci_95 = (mean_bias - 1.96 * se, mean_bias + 1.96 * se)
+    else:
+        t_stat, t_p = np.nan, np.nan
+        cohens_d = np.nan
+        ci_95 = (np.nan, np.nan)
+
+    # Wilcoxon signed-rank (requires non-zero differences)
+    nonzero = bias_values[bias_values != 0]
+    if len(nonzero) >= 10:
+        w_stat, w_p = stats.wilcoxon(nonzero)
+    else:
+        w_stat, w_p = np.nan, np.nan
+
+    return {
+        "n": n,
+        "mean": mean_bias,
+        "std": std_bias,
+        "t_stat": float(t_stat),
+        "t_p": float(t_p),
+        "cohens_d": float(cohens_d),
+        "ci_95_low": float(ci_95[0]),
+        "ci_95_high": float(ci_95[1]),
+        "w_stat": float(w_stat) if not np.isnan(w_stat) else np.nan,
+        "w_p": float(w_p) if not np.isnan(w_p) else np.nan,
+    }
+
+
+def render_coin_flip_view(df: pd.DataFrame) -> None:
+    """Render the coin flip experiment visualization."""
+    multi_run = df["run_id"].nunique() > 1
+    color_map = build_category_color_map(df)
+
+    # Compute bias DataFrame
+    bias_df = compute_coin_flip_bias(df)
+
+    # --- Sidebar ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Dataset Info")
+    st.sidebar.write(f"Total rows: {len(df):,}")
+    st.sidebar.write(f"Personas: {df['persona'].nunique()}")
+    st.sidebar.write(f"Categories: {df['category'].nunique()}")
+    models = df["model"].unique().tolist()
+    if len(models) == 1:
+        st.sidebar.write(f"Model: {models[0]}")
+    else:
+        st.sidebar.write(f"Models: {len(models)}")
+        for m in models:
+            st.sidebar.write(f"  - {m}")
+
+    # Show task source mode
+    if "use_tasks_from" in df.columns:
+        task_sources = df["use_tasks_from"].dropna().unique()
+        if len(task_sources) == 0:
+            st.sidebar.write("Tasks: per-persona")
+        else:
+            st.sidebar.write(f"Tasks from: {', '.join(task_sources)}")
+
+    if multi_run:
+        runs = df["run_id"].unique().tolist()
+        st.sidebar.write(f"Runs: {len(runs)}")
+
+    # Category filter
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filters")
+    categories = sorted(df["category"].unique())
+    selected_categories = st.sidebar.multiselect(
+        "Filter by category",
+        options=categories,
+        default=categories,
+        key="cf_category_filter",
+    )
+
+    if selected_categories:
+        filtered_df = df[df["category"].isin(selected_categories)]
+        filtered_bias = bias_df[bias_df["category"].isin(selected_categories)]
+    else:
+        filtered_df = df
+        filtered_bias = bias_df
+
+    # View mode
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("View Mode")
+    view_mode = st.sidebar.radio(
+        "Select view mode",
+        options=["All Categories", "Drill Down"],
+        index=0,
+        key="cf_view_mode",
+    )
+
+    if view_mode == "Drill Down":
+        drill_category = st.sidebar.selectbox(
+            "Select category",
+            options=sorted(filtered_df["category"].unique()),
+            key="cf_drill_category",
+        )
+        filtered_df = filtered_df[filtered_df["category"] == drill_category]
+        filtered_bias = filtered_bias[filtered_bias["category"] == drill_category]
+        group_by = "persona"
+    else:
+        group_by = "category"
+
+    # Plot type
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Chart Options")
+    plot_type = st.sidebar.radio(
+        "Plot type",
+        options=["Box", "Violin"],
+        index=0,
+        horizontal=True,
+        key="cf_plot_type",
+    ).lower()
+
+    # --- Tabs ---
+    tabs = st.tabs(["Bias Overview", "Paired Comparison", "Entropy", "Statistical Tests", "Raw Data"])
+
+    # Tab 1: Bias Overview
+    with tabs[0]:
+        st.plotly_chart(
+            create_coin_flip_bias_box(filtered_bias, group_by, plot_type, color_map, multi_run),
+            use_container_width=True,
+        )
+
+        if group_by == "persona" or len(filtered_bias) <= 80:
+            st.plotly_chart(
+                create_coin_flip_bias_bar(filtered_bias, color_map, multi_run),
+                use_container_width=True,
+            )
+
+        with st.expander("Summary Statistics"):
+            stats_group = "model" if multi_run else group_by
+            if multi_run:
+                stats_cols = ["bias"]
+                agg_df = filtered_bias.groupby([group_by, "model"])["bias"].agg(
+                    ["mean", "std", "median", "min", "max", "count"]
+                ).round(4)
+            else:
+                agg_df = filtered_bias.groupby(group_by)["bias"].agg(
+                    ["mean", "std", "median", "min", "max", "count"]
+                ).round(4)
+            st.dataframe(agg_df, use_container_width=True)
+
+            # Overall one-sample test summary
+            overall = compute_coin_flip_one_sample_tests(filtered_bias["bias"].values)
+            st.markdown(
+                f"**Overall**: mean bias = {overall['mean']:.4f} "
+                f"(95% CI: [{overall['ci_95_low']:.4f}, {overall['ci_95_high']:.4f}]), "
+                f"t({overall['n']-1}) = {overall['t_stat']:.2f}, p = {overall['t_p']:.2e}, "
+                f"Cohen's d = {overall['cohens_d']:.3f}"
+            )
+
+    # Tab 2: Paired Comparison
+    with tabs[1]:
+        st.plotly_chart(
+            create_coin_flip_dumbbell(filtered_df, group_by, color_map, multi_run),
+            use_container_width=True,
+        )
+
+        with st.expander("Paired Data Table"):
+            table_cols = ["persona", "category", "p_heads_norm_pref_heads",
+                          "p_heads_norm_pref_tails", "bias"]
+            if multi_run:
+                table_cols = ["persona", "category", "model",
+                              "p_heads_norm_pref_heads", "p_heads_norm_pref_tails", "bias"]
+            display_bias = filtered_bias[table_cols].sort_values("bias", ascending=False)
+            st.dataframe(display_bias.round(4), use_container_width=True)
+
+    # Tab 3: Entropy
+    with tabs[2]:
+        st.plotly_chart(
+            create_coin_flip_entropy_box(filtered_df, group_by, plot_type, color_map, multi_run),
+            use_container_width=True,
+        )
+
+        st.plotly_chart(
+            create_coin_flip_entropy_vs_bias(filtered_bias, color_map, multi_run),
+            use_container_width=True,
+        )
+
+        with st.expander("Summary Statistics"):
+            ent_agg = filtered_bias.groupby(group_by)["entropy_mean"].agg(
+                ["mean", "std", "median"]
+            ).round(4)
+            st.dataframe(ent_agg, use_container_width=True)
+
+            # Correlation
+            r, p_val = stats.pearsonr(
+                filtered_bias["entropy_mean"].values,
+                np.abs(filtered_bias["bias"].values),
+            )
+            st.markdown(
+                f"**Pearson r** (entropy vs |bias|): r = {r:.4f}, p = {p_val:.4e}"
+            )
+
+    # Tab 4: Statistical Tests
+    with tabs[3]:
+        st.subheader("One-Sample Tests: Is Bias Different From Zero?")
+
+        # Overall
+        overall = compute_coin_flip_one_sample_tests(filtered_bias["bias"].values)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Mean Bias", f"{overall['mean']:.4f}")
+            st.metric("Cohen's d", f"{overall['cohens_d']:.3f}")
+        with col2:
+            st.metric("t-test p-value", f"{overall['t_p']:.2e}")
+            st.metric("t-statistic", f"{overall['t_stat']:.2f}")
+        with col3:
+            w_p_str = f"{overall['w_p']:.2e}" if not np.isnan(overall['w_p']) else "N/A"
+            st.metric("Wilcoxon p-value", w_p_str)
+            st.metric("95% CI", f"[{overall['ci_95_low']:.4f}, {overall['ci_95_high']:.4f}]")
+
+        # Per-category tests
+        st.markdown("---")
+        st.subheader("Per-Category Tests (Bonferroni corrected)")
+
+        cat_results = []
+        n_cats = filtered_bias["category"].nunique()
+        for cat in sorted(filtered_bias["category"].unique()):
+            cat_bias = filtered_bias[filtered_bias["category"] == cat]["bias"].values
+            r = compute_coin_flip_one_sample_tests(cat_bias)
+            bonf_t_p = min(r["t_p"] * n_cats, 1.0) if not np.isnan(r["t_p"]) else np.nan
+            bonf_w_p = min(r["w_p"] * n_cats, 1.0) if not np.isnan(r["w_p"]) else np.nan
+            cat_results.append({
+                "category": cat,
+                "n": r["n"],
+                "mean_bias": round(r["mean"], 4),
+                "median_bias": round(float(np.median(cat_bias)), 4),
+                "std": round(r["std"], 4),
+                "t_p": r["t_p"],
+                "t_p_bonf": bonf_t_p,
+                "w_p": r["w_p"],
+                "w_p_bonf": bonf_w_p,
+                "sig": "*" if (not np.isnan(bonf_t_p) and bonf_t_p < 0.05) else "",
+            })
+
+        cat_df = pd.DataFrame(cat_results)
+        st.dataframe(
+            cat_df.style.format({
+                "t_p": "{:.2e}", "t_p_bonf": "{:.2e}",
+                "w_p": "{:.2e}", "w_p_bonf": "{:.2e}",
+            }),
+            use_container_width=True,
+        )
+
+        # Between-category tests
+        st.markdown("---")
+        st.subheader("Between-Category Comparisons")
+        st.markdown(
+            "**Kruskal-Wallis** omnibus test + pairwise **Mann-Whitney U**. "
+            "Effect size: rank-biserial correlation (r)."
+        )
+
+        groups_list = sorted(filtered_bias[group_by].unique())
+        if len(groups_list) < 2:
+            st.warning("Need at least 2 groups for between-group tests.")
+        else:
+            kw_stat, kw_p, p_df, r_df = compute_user_turn_statistical_tests(
+                filtered_bias, group_by, "bias",
+            )
+            render_user_turn_stat_test_heatmaps(p_df, r_df, kw_stat, kw_p, "Bias")
+
+    # Tab 5: Raw Data
+    with tabs[4]:
+        st.subheader("Raw Data")
+        data_view = st.radio(
+            "View",
+            options=["Raw (all rows)", "Bias (per persona)"],
+            horizontal=True,
+            key="cf_raw_view",
+        )
+
+        if data_view == "Raw (all rows)":
+            default_cols = [
+                "persona", "category", "ordering", "model",
+                "p_heads_normalized", "p_tails_normalized", "entropy",
+            ]
+            if multi_run:
+                default_cols.insert(3, "run_id")
+            default_cols = [c for c in default_cols if c in filtered_df.columns]
+            display_cols = st.multiselect(
+                "Select columns",
+                options=filtered_df.columns.tolist(),
+                default=default_cols,
+                key="cf_raw_cols",
+            )
+            if display_cols:
+                st.dataframe(filtered_df[display_cols], use_container_width=True)
+        else:
+            default_cols = [
+                "persona", "category", "model", "bias",
+                "p_heads_norm_pref_heads", "p_heads_norm_pref_tails",
+                "entropy_mean",
+            ]
+            if multi_run:
+                default_cols.insert(3, "run_id")
+            default_cols = [c for c in default_cols if c in filtered_bias.columns]
+            display_cols = st.multiselect(
+                "Select columns",
+                options=filtered_bias.columns.tolist(),
+                default=default_cols,
+                key="cf_bias_cols",
+            )
+            if display_cols:
+                st.dataframe(filtered_bias[display_cols].round(4), use_container_width=True)
+
+        # Token variant summary
+        with st.expander("Token Variant Summary"):
+            if "token_probs" in df.columns:
+                # Extract token probs from the first run's data
+                token_rows = []
+                for _, row in df.iterrows():
+                    tp = row["token_probs"]
+                    if isinstance(tp, dict):
+                        for variant, prob in tp.items():
+                            token_rows.append({
+                                "variant": variant.replace(" ", "\u00b7") if variant.startswith(" ") else variant,
+                                "raw_variant": variant,
+                                "prob": prob,
+                                "side": "heads" if variant.strip().lower() in {"heads", "head"} else "tails",
+                            })
+                if token_rows:
+                    tv_df = pd.DataFrame(token_rows)
+                    summary = tv_df.groupby(["side", "variant"])["prob"].agg(
+                        ["mean", "std", "max"]
+                    ).round(6).sort_values("mean", ascending=False)
+                    st.dataframe(summary, use_container_width=True)
+
+                    total_heads = tv_df[tv_df["side"] == "heads"]["prob"].mean()
+                    total_tails = tv_df[tv_df["side"] == "tails"]["prob"].mean()
+                    dominant = summary["mean"].idxmax()
+                    dominant_frac = summary.loc[dominant, "mean"] / (total_heads + total_tails) * 100
+                    st.markdown(
+                        f"**Dominant variant**: {dominant[1]} "
+                        f"({dominant_frac:.1f}% of heads+tails probability)"
+                    )
+            else:
+                st.info("No token_probs data available.")
+
+
 def main():
     st.title("Persona Experiment Results")
 
@@ -4362,6 +4963,37 @@ def main():
 
     if selected_key:
         file_path, result_type = file_options[selected_key]
+
+        # Coin flip: multi-run support — collect all coin-flip entries for comparison
+        if result_type == "coin_flip":
+            coin_flip_entries = {
+                k: (p, t) for k, (p, t) in file_options.items() if t == "coin_flip"
+            }
+            if len(coin_flip_entries) > 1:
+                all_coin_keys = list(coin_flip_entries.keys())
+                selected_coin_keys = st.sidebar.multiselect(
+                    "Compare runs",
+                    options=all_coin_keys,
+                    default=[selected_key],
+                    format_func=lambda x: label_map[x],
+                    key="cf_run_selector",
+                )
+                if not selected_coin_keys:
+                    selected_coin_keys = [selected_key]
+            else:
+                selected_coin_keys = [selected_key]
+
+            with st.spinner("Loading results..."):
+                frames = []
+                for k in selected_coin_keys:
+                    p, _ = file_options[k]
+                    run_df = load_results(p)
+                    run_df["run_id"] = p.parent.name
+                    frames.append(run_df)
+                df = pd.concat(frames, ignore_index=True)
+
+            render_coin_flip_view(df)
+            return
 
         # Load data
         with st.spinner("Loading results..."):
