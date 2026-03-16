@@ -4375,6 +4375,22 @@ def compute_coin_flip_bias(df: pd.DataFrame) -> pd.DataFrame:
     return bias_df
 
 
+def _add_group_means(fig: go.Figure, df: pd.DataFrame, group_by: str, y_col: str) -> None:
+    """Add dashed lines showing per-group means to a box/violin figure."""
+    groups = df[group_by].unique().tolist()
+    means = df.groupby(group_by)[y_col].mean()
+    for group in groups:
+        x_idx = groups.index(group)
+        mean_val = means[group]
+        fig.add_shape(
+            type="line",
+            x0=x_idx - 0.4, x1=x_idx + 0.4,
+            y0=mean_val, y1=mean_val,
+            line=dict(color="black", width=2, dash="dash"),
+            xref="x", yref="y",
+        )
+
+
 def create_coin_flip_bias_box(
     bias_df: pd.DataFrame,
     group_by: str,
@@ -4409,6 +4425,8 @@ def create_coin_flip_bias_box(
         )
 
     fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="no bias")
+    if not multi_run:
+        _add_group_means(fig, bias_df, group_by, "bias")
     fig.update_layout(height=600, xaxis_tickangle=-45, showlegend=True)
     return fig
 
@@ -4538,6 +4556,8 @@ def create_coin_flip_entropy_box(
             **kwargs,
         )
 
+    if not multi_run:
+        _add_group_means(fig, df, group_by, "entropy")
     fig.update_layout(height=600, xaxis_tickangle=-45)
     return fig
 
@@ -4643,6 +4663,8 @@ def create_coin_flip_p_preferred_box(
         )
 
     fig.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="fair coin")
+    if not multi_run:
+        _add_group_means(fig, df, group_by, "p_preferred")
     fig.update_layout(height=600, xaxis_tickangle=-45, showlegend=True)
     return fig
 
