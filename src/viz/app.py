@@ -4719,9 +4719,24 @@ def render_coin_flip_view(df: pd.DataFrame) -> None:
         runs = df["run_id"].unique().tolist()
         st.sidebar.write(f"Runs: {len(runs)}")
 
-    # Category filter
+    # Model/run filter (when multiple runs loaded)
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filters")
+
+    if multi_run:
+        all_models = sorted(df["model"].unique().tolist())
+        selected_models = st.sidebar.multiselect(
+            "Filter by model",
+            options=all_models,
+            default=all_models,
+            key="cf_model_filter",
+        )
+        if selected_models:
+            df = df[df["model"].isin(selected_models)]
+            bias_df = bias_df[bias_df["model"].isin(selected_models)]
+        multi_run = df["model"].nunique() > 1
+
+    # Category filter
     categories = sorted(df["category"].unique())
     selected_categories = st.sidebar.multiselect(
         "Filter by category",
@@ -5098,28 +5113,15 @@ def main():
     if selected_key:
         file_path, result_type = file_options[selected_key]
 
-        # Coin flip: multi-run support — collect all coin-flip entries for comparison
+        # Coin flip: always load ALL coin-flip runs, filter in sidebar
         if result_type == "coin_flip":
-            coin_flip_entries = {
-                k: (p, t) for k, (p, t) in file_options.items() if t == "coin_flip"
-            }
-            if len(coin_flip_entries) > 1:
-                all_coin_keys = list(coin_flip_entries.keys())
-                selected_coin_keys = st.sidebar.multiselect(
-                    "Compare runs",
-                    options=all_coin_keys,
-                    default=[selected_key],
-                    format_func=lambda x: label_map[x],
-                    key="cf_run_selector",
-                )
-                if not selected_coin_keys:
-                    selected_coin_keys = [selected_key]
-            else:
-                selected_coin_keys = [selected_key]
+            all_coin_keys = [
+                k for k, (p, t) in file_options.items() if t == "coin_flip"
+            ]
 
             with st.spinner("Loading results..."):
                 frames = []
-                for k in selected_coin_keys:
+                for k in all_coin_keys:
                     p, _ = file_options[k]
                     run_df = load_results(p)
                     run_df["run_id"] = p.parent.name

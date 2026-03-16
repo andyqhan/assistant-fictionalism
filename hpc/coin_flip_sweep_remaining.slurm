@@ -1,0 +1,76 @@
+#!/bin/bash
+#SBATCH --account=torch_pr_62_tandon_priority
+#SBATCH --job-name=coin-flip-sweep2
+#SBATCH --output=logs/coin_flip_sweep2_%j.log
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128GB
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --time=00:30:00
+
+set -e
+
+echo "=========================================="
+echo "Job ID: ${SLURM_JOB_ID}"
+echo "Node: $(hostname)"
+echo "Start time: $(date)"
+echo "=========================================="
+
+PROJECT_DIR="/scratch/ah7660/assistant-fictionalism"
+CONTAINER="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
+VENV="/scratch/ah7660/venvs/assistant-fictionalism-env"
+
+export HF_HOME="/scratch/ah7660/hf_cache"
+export TRANSFORMERS_CACHE="/scratch/ah7660/hf_cache"
+export PYTHONUNBUFFERED=1
+
+cd "${PROJECT_DIR}"
+
+echo ""
+echo "GPU Info:"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+echo ""
+
+# Only the models that failed on L40S
+MODELS=(
+    "Qwen/Qwen3-14B"
+    "Qwen/Qwen3-32B"
+)
+
+COMMON_ARGS="--personae-json=datasets/coin-flip-personae.json --use-tasks-from=assistant --system-prompt-style=you-are-a"
+
+# Use the original job ID for consistent naming with the 4B/8B results
+ORIG_JOB=4372596
+
+for MODEL in "${MODELS[@]}"; do
+    SLUG=$(echo "$MODEL" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]')
+    OUTPUT_DIR="logs/coin-flip-${ORIG_JOB}-${SLUG}"
+
+    echo ""
+    echo "=========================================="
+    echo "Running: ${MODEL}"
+    echo "Output:  ${OUTPUT_DIR}"
+    echo "Time:    $(date)"
+    echo "=========================================="
+
+    singularity exec --nv \
+        --bind /scratch:/scratch \
+        "${CONTAINER}" \
+        bash -c "
+            source ${VENV}/bin/activate && \
+            python -m src.batch.coin_flip \
+                --model=${MODEL} \
+                --output-dir=${OUTPUT_DIR} \
+                --batch-size=32 \
+                ${COMMON_ARGS}
+        "
+
+    echo "Finished ${MODEL} at $(date)"
+done
+
+echo ""
+echo "=========================================="
+echo "All models complete"
+echo "End time: $(date)"
+echo "=========================================="
