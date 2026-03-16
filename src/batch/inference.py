@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.model_profile import detect_model_profile
 from src.template import patch_chat_template
 
 from .config import BatchInferenceConfig
@@ -33,10 +34,6 @@ from .metrics import (
     compute_top_k_mass,
 )
 from .system_prompts import generate_system_prompt
-
-
-# Qwen3 </think> token ID
-THINK_END_TOKEN_ID = 151668
 
 
 class GPUMonitor:
@@ -313,7 +310,9 @@ def configs_match(saved_config: dict, current_config: "BatchInferenceConfig") ->
     # Compare all keys except output_dir (which was already excluded)
     saved_comparable = {k: v for k, v in saved_config.items() if k != "output_dir"}
 
-    return current_dict == saved_comparable
+    # Only compare keys present in both (handles new fields added after old runs)
+    common_keys = set(current_dict.keys()) & set(saved_comparable.keys())
+    return all(current_dict[k] == saved_comparable[k] for k in common_keys)
 
 
 def filter_completed_tasks(
@@ -381,6 +380,11 @@ class VLLMInferenceRunner:
         # Store original template for persona patching
         self._original_template = self.tokenizer.chat_template
 
+        # Detect model family
+        self.profile = detect_model_profile(self.tokenizer)
+        self.think_end_token_id = self.profile.think_end_token_id
+        print(f"Detected model family: {self.profile.family} (thinking={self.profile.supports_thinking})")
+
         # Resolve logprobs_k: -1 means full vocab, 0 when metrics disabled
         if cfg.no_metrics:
             self.logprobs_k = 0
@@ -401,6 +405,8 @@ class VLLMInferenceRunner:
         if not cfg.no_metrics:
             # max_logprobs=-1 removes the cap, allowing full vocab logprobs for accurate entropy
             llm_kwargs["max_logprobs"] = -1
+        if cfg.max_model_len > 0:
+            llm_kwargs["max_model_len"] = cfg.max_model_len
         self.llm = LLM(**llm_kwargs)
 
         # Sampling params (logprobs only when metrics enabled)
@@ -416,7 +422,7 @@ class VLLMInferenceRunner:
 
     def set_persona(self, persona: str) -> None:
         """Set the current persona for template patching."""
-        patch_chat_template(self.tokenizer, self._original_template, persona)
+        patch_chat_template(self.tokenizer, self._original_template, persona, self.profile)
 
     def prepare_input(self, system_prompt: str, user_prompt: str) -> str:
         """Prepare a single input text with system prompt and user message."""
@@ -425,12 +431,10 @@ class VLLMInferenceRunner:
             {"role": "user", "content": user_prompt},
         ]
 
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.cfg.thinking_mode,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.cfg.thinking_mode
+        text = self.tokenizer.apply_chat_template(messages, **kwargs)
 
         return text
 
@@ -474,13 +478,13 @@ class VLLMInferenceRunner:
 
             # Compute metrics from logprobs (or skip if disabled)
             if self.cfg.no_metrics:
-                metrics = compute_section_summaries([], [], [], [], THINK_END_TOKEN_ID)
+                metrics = compute_section_summaries([], [], [], [], self.think_end_token_id)
                 metrics["num_tokens"] = len(token_ids)
             else:
                 metrics = compute_metrics_for_vllm_output(
                     logprobs=generation.logprobs,
                     token_ids=token_ids,
-                    think_end_token_id=THINK_END_TOKEN_ID,
+                    think_end_token_id=self.think_end_token_id,
                     top_k_mass_k=self.cfg.top_k_mass_k,
                 )
 
@@ -551,6 +555,11 @@ class TransformersInferenceRunner:
         # Store original template for persona patching
         self._original_template = self.tokenizer.chat_template
 
+        # Detect model family
+        self.profile = detect_model_profile(self.tokenizer)
+        self.think_end_token_id = self.profile.think_end_token_id
+        print(f"Detected model family: {self.profile.family} (thinking={self.profile.supports_thinking})")
+
         # Load model with FlashAttention2 (fallback to default if unavailable)
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -575,7 +584,7 @@ class TransformersInferenceRunner:
 
     def set_persona(self, persona: str) -> None:
         """Set the current persona for template patching."""
-        patch_chat_template(self.tokenizer, self._original_template, persona)
+        patch_chat_template(self.tokenizer, self._original_template, persona, self.profile)
 
     def prepare_input(self, system_prompt: str, user_prompt: str) -> str:
         """Prepare a single input text with system prompt and user message."""
@@ -584,12 +593,10 @@ class TransformersInferenceRunner:
             {"role": "user", "content": user_prompt},
         ]
 
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.cfg.thinking_mode,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.cfg.thinking_mode
+        text = self.tokenizer.apply_chat_template(messages, **kwargs)
 
         return text
 
@@ -718,7 +725,7 @@ class TransformersInferenceRunner:
                 surps = surps[:-1]
 
             response = self.tokenizer.decode(tokens, skip_special_tokens=True)
-            metrics = compute_section_summaries(ents, top_ks, surps, tokens, THINK_END_TOKEN_ID)
+            metrics = compute_section_summaries(ents, top_ks, surps, tokens, self.think_end_token_id)
 
             results.append({
                 "persona": task.persona_info.persona,
@@ -909,6 +916,12 @@ def parse_args() -> argparse.Namespace:
         choices=["transformers", "vllm"],
         help="Backend: 'transformers' (accurate full-vocab entropy) or 'vllm' (fast, approximate entropy)",
     )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=0,
+        help="vLLM max_model_len (0 = use model default). Cap this to reduce GPU memory usage.",
+    )
 
     return parser.parse_args()
 
@@ -936,6 +949,7 @@ def main() -> None:
         subset_prompt=args.subset_prompt,
         backend=args.backend,
         no_metrics=args.no_metrics,
+        max_model_len=args.max_model_len,
     )
 
     print(f"Configuration: {cfg.to_dict()}")

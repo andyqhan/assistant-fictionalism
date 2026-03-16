@@ -110,7 +110,7 @@ def compute_section_summaries(
     top_k_masses: list[float],
     surprisals: list[float],
     token_ids: list[int],
-    think_end_token_id: int,
+    think_end_token_id: int | None,
 ) -> dict:
     """Compute summary statistics for entropy, top-k mass, and surprisal, split by thinking/output.
 
@@ -143,12 +143,13 @@ def compute_section_summaries(
         result["num_tokens"] = 0
         return result
 
-    # Find </think> position
+    # Find </think> position (skip search when think_end_token_id is None)
     think_end_position = None
-    for i, tid in enumerate(token_ids):
-        if tid == think_end_token_id:
-            think_end_position = i
-            break
+    if think_end_token_id is not None:
+        for i, tid in enumerate(token_ids):
+            if tid == think_end_token_id:
+                think_end_position = i
+                break
 
     # Split into sections
     if think_end_position is not None:
@@ -192,7 +193,7 @@ def compute_section_summaries(
 def compute_metrics_for_sequence(
     logits_list: list[torch.Tensor],
     token_ids: list[int],
-    think_end_token_id: int,
+    think_end_token_id: int | None,
     top_k: int,
 ) -> dict:
     """
@@ -280,7 +281,7 @@ def compute_token_top_k_mass_from_logprobs(
 def compute_metrics_for_vllm_output(
     logprobs: list[dict[int, Logprob]] | None,
     token_ids: list[int],
-    think_end_token_id: int,
+    think_end_token_id: int | None,
     top_k_mass_k: int,
 ) -> dict:
     """

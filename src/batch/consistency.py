@@ -25,15 +25,12 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
+from src.model_profile import detect_model_profile
 from src.template import patch_chat_template
 
 from .embeddings import extract_output, extract_thinking, last_token_pool
 from .metrics import compute_metrics_for_vllm_output
 from .system_prompts import generate_system_prompt
-
-
-# Qwen3 </think> token ID
-THINK_END_TOKEN_ID = 151668
 
 
 class GPUMonitor:
@@ -425,6 +422,11 @@ class ConsistencyInferenceRunner:
         # Store original template for persona patching
         self._original_template = self.tokenizer.chat_template
 
+        # Detect model family
+        self.profile = detect_model_profile(self.tokenizer)
+        self.think_end_token_id = self.profile.think_end_token_id
+        print(f"Detected model family: {self.profile.family} (thinking={self.profile.supports_thinking})")
+
         # Resolve logprobs_k: -1 means full vocab
         if cfg.logprobs_k == -1:
             self.logprobs_k = self.tokenizer.vocab_size
@@ -453,7 +455,7 @@ class ConsistencyInferenceRunner:
 
     def set_persona(self, persona: str) -> None:
         """Set the current persona for template patching."""
-        patch_chat_template(self.tokenizer, self._original_template, persona)
+        patch_chat_template(self.tokenizer, self._original_template, persona, self.profile)
 
     def prepare_turn1_input(self, system_prompt: str, question: str) -> str:
         """Prepare input text for turn 1 (system + question)."""
@@ -462,12 +464,10 @@ class ConsistencyInferenceRunner:
             {"role": "user", "content": question},
         ]
 
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.cfg.thinking_mode,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.cfg.thinking_mode
+        text = self.tokenizer.apply_chat_template(messages, **kwargs)
 
         return text
 
@@ -482,12 +482,10 @@ class ConsistencyInferenceRunner:
             {"role": "user", "content": follow_up},
         ]
 
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.cfg.thinking_mode,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.cfg.thinking_mode
+        text = self.tokenizer.apply_chat_template(messages, **kwargs)
 
         return text
 
@@ -538,7 +536,7 @@ class ConsistencyInferenceRunner:
             metrics = compute_metrics_for_vllm_output(
                 logprobs=generation.logprobs,
                 token_ids=token_ids,
-                think_end_token_id=THINK_END_TOKEN_ID,
+                think_end_token_id=self.think_end_token_id,
                 top_k_mass_k=self.cfg.top_k_mass_k,
             )
             turn1_metrics.append(metrics)
@@ -568,7 +566,7 @@ class ConsistencyInferenceRunner:
             metrics2 = compute_metrics_for_vllm_output(
                 logprobs=generation.logprobs,
                 token_ids=token_ids,
-                think_end_token_id=THINK_END_TOKEN_ID,
+                think_end_token_id=self.think_end_token_id,
                 top_k_mass_k=self.cfg.top_k_mass_k,
             )
 

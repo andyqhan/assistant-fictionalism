@@ -5,6 +5,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 from .device import get_device, get_dtype
+from .model_profile import detect_model_profile
 from .template import patch_chat_template
 
 
@@ -32,6 +33,7 @@ class ChatModel:
         assert hasattr(self.tokenizer, "chat_template"), "Tokenizer missing chat_template"
 
         self._original_template = self.tokenizer.chat_template
+        self.profile = detect_model_profile(self.tokenizer)
 
         # device_map="auto" doesn't work well with MPS, causes disk offloading
         if self.device == "cuda":
@@ -55,7 +57,7 @@ class ChatModel:
         assert isinstance(persona, str), f"Persona must be a string, got {type(persona)}"
 
         self.persona = persona
-        patch_chat_template(self.tokenizer, self._original_template, persona)
+        patch_chat_template(self.tokenizer, self._original_template, persona, self.profile)
 
     def set_system_prompt(self, prompt: str) -> None:
         """Set the system prompt."""
@@ -92,12 +94,10 @@ class ChatModel:
         if self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
 
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.enable_thinking,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.enable_thinking
+        text = self.tokenizer.apply_chat_template(messages, **kwargs)
 
         inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
 

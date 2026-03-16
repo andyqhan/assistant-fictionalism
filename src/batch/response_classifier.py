@@ -408,6 +408,10 @@ class ResponseClassifierRunner:
 
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
 
+        # Detect model family for conditional enable_thinking
+        from src.model_profile import detect_model_profile
+        self.profile = detect_model_profile(self.tokenizer)
+
         self.llm = LLM(
             model=cfg.model,
             dtype="auto",
@@ -432,12 +436,10 @@ class ResponseClassifierRunner:
         )
 
         messages = [{"role": "user", "content": content}]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.cfg.thinking_mode,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.cfg.thinking_mode
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
 
     def run_batch(self, tasks: list[ClassifierTask]) -> list[dict]:
         """Run classification on a batch of tasks."""

@@ -23,6 +23,7 @@ class BatchInferenceConfig:
     subset_prompt: float = 1.0
     backend: str = "transformers"  # "transformers" or "vllm"
     no_metrics: bool = False  # Skip logprobs/entropy/top-k-mass (vLLM only)
+    max_model_len: int = 0  # vLLM max_model_len (0 = use model default)
 
     def __post_init__(self) -> None:
         # Validate paths exist
@@ -83,6 +84,7 @@ class BatchInferenceConfig:
             "subset_prompt": self.subset_prompt,
             "backend": self.backend,
             "no_metrics": self.no_metrics,
+            "max_model_len": self.max_model_len,
         }
 
     def to_comparable_dict(self) -> dict:

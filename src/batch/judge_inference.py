@@ -368,6 +368,10 @@ class JudgeInferenceRunner:
         # Load tokenizer for chat template
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
 
+        # Detect model family for conditional enable_thinking
+        from src.model_profile import detect_model_profile
+        self.profile = detect_model_profile(self.tokenizer)
+
         # Initialize vLLM
         self.llm = LLM(
             model=cfg.model,
@@ -398,12 +402,10 @@ class JudgeInferenceRunner:
 
         # Apply chat template for proper model formatting
         messages = [{"role": "user", "content": content}]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,  # Enable thinking for judge responses
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = True
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
 
     def run_batch(self, tasks: list[JudgeTask]) -> list[dict]:
         """Run judge inference on a batch of tasks."""

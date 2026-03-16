@@ -293,6 +293,10 @@ class TCLLMRunner:
         # Load tokenizer for chat template
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model)
 
+        # Detect model family for conditional enable_thinking
+        from src.model_profile import detect_model_profile
+        self.profile = detect_model_profile(self.tokenizer)
+
         # Initialize vLLM
         self.llm = LLM(
             model=cfg.model,
@@ -320,12 +324,10 @@ class TCLLMRunner:
     def _apply_chat_template(self, user_content: str) -> str:
         """Format user content with chat template."""
         messages = [{"role": "user", "content": user_content}]
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.cfg.thinking_mode,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if self.profile.supports_thinking:
+            kwargs["enable_thinking"] = self.cfg.thinking_mode
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
 
     def _generate_in_chunks(
         self, prompts: list[str], sampling_params, desc: str
